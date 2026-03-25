@@ -1,8 +1,8 @@
 /**
 * Name: HanoiFloodingModel
-* This model is based on the hydrological model developed by Patrick Taillandier in the ARCHIVES Project. The model incorporates modifications to ensure compatibility with GAMA 2025-06. 
+* This model is based on the hydrological model developed by Patrick Taillandier in the ARCHIVES Project. The model incorporates modifications to ensure compatibility with GAMA 2025-06.
 * Author: Thanh-Do Nguyen (Nguyen Thanh Do)
-* Tags: 
+* Tags:
 */
 model HanoiFloodingModel
 
@@ -36,15 +36,16 @@ global {
 			if (is_inactive) {
 				altitude2 <- 0;
 			}
-
 		}
 
 		active_cells <- cell where !(each.is_inactive);
+
+		// Cache active neighbours once (is_inactive never changes after init)
 		ask active_cells {
-			if (length(self.neighbour_cells()) < neighbours_type) {
+			active_neighbours <- (self neighbors_at 1) where !(each.is_inactive);
+			if (length(active_neighbours) < neighbours_type) {
 				is_drain <- true;
 			}
-
 		}
 
 		max_altitude <- active_cells max_of (each.altitude2);
@@ -63,9 +64,7 @@ global {
 					water_height <- water_inp;
 					do update_color;
 				}
-
 			}
-
 		}
 
 		create lake from: lakes_shapefile {
@@ -74,9 +73,7 @@ global {
 					water_height <- water_inp;
 					do update_color;
 				}
-
 			}
-
 		}
 
 		drains <- active_cells where (each.is_drain);
@@ -86,7 +83,6 @@ global {
 		ask active_cells {
 			water_height <- water_height + rain;
 		}
-
 	}
 
 	reflex adding_input_water {
@@ -94,9 +90,7 @@ global {
 			ask so.cells_concerned {
 				water_height <- water_height + (so.water_input * water_inp);
 			}
-
 		}
-
 	}
 
 	reflex flowing {
@@ -109,33 +103,28 @@ global {
 				ask (shuffle(active_cells)) {
 					do flow1;
 				}
-
 			}
 
 			match 2 {
 				ask (active_cells sort_by ((each.altitude2 + each.water_height + (each.the_digue = nil ? 0.0 : each.the_digue.height)))) {
 					do flow2;
 				}
-
 			}
-
 		}
-
 	}
 
 	reflex evaporation {
-		ask active_cells {
+		// Only evaporate and update color for cells that have water
+		ask active_cells where (each.water_height > 0) {
 			water_height <- water_height - evaporation;
 			do update_color;
 		}
-
 	}
 
 	reflex draining {
 		ask drains {
 			water_height <- 0;
 		}
-
 	}
 
 	species river {
@@ -143,7 +132,6 @@ global {
 		aspect geometry {
 			draw shape color: rgb("blue") depth: world.water_inp;
 		}
-
 	}
 
 	species lake {
@@ -151,7 +139,6 @@ global {
 		aspect geometry {
 			draw shape color: rgb("green") depth: world.water_inp;
 		}
-
 	}
 
 	species building parent: digue frequency: 0 {
@@ -159,7 +146,6 @@ global {
 		aspect geometry {
 			draw shape color: rgb("pink") depth: 100;
 		}
-
 	}
 
 	species digue {
@@ -171,7 +157,6 @@ global {
 			ask cells_concerned {
 				the_digue <- myself;
 			}
-
 		}
 
 		aspect geometry {
@@ -182,7 +167,6 @@ global {
 			ask cells_concerned {
 				the_digue <- nil;
 			}
-
 			do die;
 		}
 
@@ -196,15 +180,14 @@ global {
 		aspect geometry {
 			draw shape + 2.0 color: rgb("green") depth: water_input;
 		}
-
 	}
 
 	grid cell width: nb_cols height: nb_rows neighbors: neighbours_type frequency: 0 use_regular_agents: false use_individual_shapes: false {
 		bool is_inactive <- false;
 		float altitude2;
-		list<cell> neighbour_cells {
-			return (self neighbors_at 1) where !(each.is_inactive);
-		}
+
+		// Cached active neighbours - computed once during init
+		list<cell> active_neighbours;
 
 		float water_height <- 0.0 min: 0.0;
 		rgb color_mnt;
@@ -221,7 +204,8 @@ global {
 
 		action flow2 {
 			if (water_height > 0) {
-				list<cell> neighbour_cells_al <- self.neighbour_cells() where (each.already);
+				// Use cached neighbours instead of recomputing each call
+				list<cell> neighbour_cells_al <- active_neighbours where (each.already);
 				if (!empty(neighbour_cells_al)) {
 					ask neighbour_cells_al {
 						height2 <- altitude2 + water_height + (the_digue = nil ? 0.0 : the_digue.height);
@@ -236,11 +220,8 @@ global {
 							water_height <- water_height - water_flowing;
 							flow_cell.water_height <- flow_cell.water_height + water_flowing;
 						}
-
 					}
-
 				}
-
 			}
 
 			already <- true;
@@ -248,7 +229,8 @@ global {
 
 		action flow1 {
 			if (water_height > 0) {
-				list<cell> neighbour_cells_al <- self.neighbour_cells() where (each.already);
+				// Use cached neighbours instead of recomputing each call
+				list<cell> neighbour_cells_al <- active_neighbours where (each.already);
 				if (!empty(neighbour_cells_al)) {
 					ask neighbour_cells_al {
 						height2 <- altitude2 + water_height + (the_digue = nil ? 0.0 : the_digue.height);
@@ -263,11 +245,8 @@ global {
 							flow_cell.water_height <- flow_cell.water_height + water_flowing;
 							height2 <- altitude2 + water_height;
 						}
-
 					}
-
 				}
-
 			}
 
 			already <- true;
@@ -281,9 +260,7 @@ global {
 			rgb c <- water_height > 0 ? color : color_mnt;
 			draw shape color: c border: c depth: water_height;
 		}
-
 	}
-
 }
 
 experiment main_gui type: gui {
@@ -303,9 +280,7 @@ experiment main_gui type: gui {
 			if (resolution in [10, 25, 40, 50]) {
 				create simulation with: [resolution_grille::resolution];
 			}
-
 		}
-
 	}
 
 	output {
@@ -316,7 +291,5 @@ experiment main_gui type: gui {
 			species digue aspect: geometry;
 			grid cell transparency: 0.5 elevation: -0.1;
 		}
-
 	}
-
 }
