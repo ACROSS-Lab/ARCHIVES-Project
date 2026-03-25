@@ -27,6 +27,7 @@ global {
 	float diffusion_rate <- 0.8;
 	int algo_flowing <- 1 among: [1, 2];
 	list<cell> active_cells;
+	string export_dir <- "../exported_results/";
 
 	init {
 		matrix mnt_val <- matrix(mnt_csv);
@@ -125,6 +126,17 @@ global {
 		ask drains {
 			water_height <- 0;
 		}
+	}
+
+	reflex export_water_height when: cycle < 100 {
+		string step_str <- (cycle < 10 ? "00" : (cycle < 100 ? "0" : "")) + string(cycle);
+		string base_name <- export_dir + "water_height_res" + resolution_grille + "_step" + step_str;
+		ask cell {
+			grid_value <- water_height;
+		}
+		save cell to: base_name + ".tif" format: "geotiff";
+		save cell to: base_name + ".csv" format: "csv";
+		write "Exported step " + cycle + " to " + base_name;
 	}
 
 	species river {
