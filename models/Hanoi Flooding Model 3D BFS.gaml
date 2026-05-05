@@ -266,16 +266,16 @@ global {
 		}
 	}
 
-	reflex export_water_height when: cycle mod 24 = 0 and cycle <= total_cycles {
-		int day <- int(cycle / 24);
-		string day_str <- (day < 10 ? "0" : "") + string(day);
-		string base_name <- export_dir + "water_height_3D_BFS_res" + resolution_grille + "_day" + day_str;
-		ask cell {
-			grid_value <- water_height;
-		}
-		save cell to: base_name + ".tif" format: "geotiff";
-		write "Exported day " + day + " (cycle " + cycle + ") -> " + base_name;
-	}
+//	reflex export_water_height when: cycle mod 24 = 0 and cycle <= total_cycles {
+//		int day <- int(cycle / 24);
+//		string day_str <- (day < 10 ? "0" : "") + string(day);
+//		string base_name <- export_dir + "water_height_3D_BFS_res" + resolution_grille + "_day" + day_str;
+//		ask cell {
+//			grid_value <- water_height;
+//		}
+//		save cell to: base_name + ".tif" format: "geotiff";
+//		write "Exported day " + day + " (cycle " + cycle + ") -> " + base_name;
+//	}
 
 	species river {
 		list<cell> cells_concerned;
