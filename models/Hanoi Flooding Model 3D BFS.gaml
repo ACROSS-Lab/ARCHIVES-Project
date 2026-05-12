@@ -101,14 +101,20 @@ global {
 
 		create river from: river_shapefile {
 			cells_concerned <- cell overlapping self;
-			if (river_input) {
-				ask cells_concerned {
-					water_volume <- world.water_inp * world.cell_area;
-					is_water <- true;
-				}
-			}
 		}
 		river_cells <- remove_duplicates(river accumulate (each.cells_concerned)) where !(each.is_inactive);
+
+		// Seed the river with a flat water SURFACE (not flat depth): pick the
+		// highest river-bed altitude as the reference top, add water_inp, then
+		// give each river cell whatever depth brings it up to that surface.
+		if (river_input and !empty(river_cells)) {
+			float initial_surface <- (river_cells max_of (each.altitude2)) + water_inp;
+			write "Initial river surface elevation: " + initial_surface + " m";
+			ask river_cells {
+				water_volume <- (initial_surface - altitude2) * world.cell_area;
+				is_water <- true;
+			}
+		}
 
 		// Lake is loaded for display only; no water seeded.
 		create lake from: lakes_shapefile {
@@ -397,13 +403,13 @@ experiment main_gui type: gui {
 	output {
 		display map type: opengl {
 			mesh elevation_map
-				scale: 1
+				scale: 10
 				grayscale: true
 				smooth: false
 				triangulation: true;
 
 			mesh water_field
-				scale: 1
+				scale: 10
 				color: rgb(100, 150, 255, 180)
 				smooth: false
 				triangulation: true;
