@@ -15,6 +15,8 @@ global {
 	file river_shapefile <- file("../includes/RedRiver1925.shp");
 	file lakes_shapefile <- file("../includes/Lakes1925.shp");
 	file buildings_shapefile <- file("../includes/Buildings1925.shp");
+	file dykes_shape_file <- shape_file("../includes/Dykes.shp");
+	float dyke_height <- 2.0 min: 0.0 max: 10.0 step: 0.5;             // m, uniform dyke barrier height
 	int resolution_grille <- 10 among: [10, 25, 40, 50];
 	file mnt_csv <- file("../includes/mnt-gz" + resolution_grille + ".csv");
 	geometry shape <- envelope("../includes/mnt-gz" + resolution_grille + ".asc");
@@ -92,6 +94,12 @@ global {
 		}
 
 		create building from: buildings_shapefile with: [height::rnd(10) + 5.0];
+
+		// Dykes act as barriers. Each dyke's footprint cells store the_digue,
+		// and flow1/flow2 already use (terrain + the_digue.height) as the head
+		// water has to clear before flowing into the cell.
+		create digue from: dykes_shape_file with: [height::dyke_height];
+		write "Dyke segments created: " + length(digue) + " | dyke height = " + dyke_height + " m";
 
 		create river from: river_shapefile {
 			cells_concerned <- cell overlapping self;
@@ -336,6 +344,7 @@ experiment main_gui type: gui {
 	parameter "River flow rate (m^3/day)" var: flow_rate;
 	parameter "Evaporation (m/day)" var: evaporation;
 	parameter "River input enabled" var: river_input;
+	parameter "Dyke height (m)" var: dyke_height;
 	parameter "Diffusion rate" var: diffusion_rate;
 	parameter "Flowing algorithm" var: algo_flowing;
 	parameter "Min visible depth (m)" var: min_visible_depth;
@@ -354,13 +363,13 @@ experiment main_gui type: gui {
 	output {
 		display map type: opengl {
 			mesh elevation_map
-				scale: 100
+				scale: 1
 				grayscale: true
 				smooth: false
 				triangulation: true;
 
 			mesh water_field
-				scale: 100
+				scale: 1
 				color: rgb(100, 150, 255, 180)
 				smooth: false
 				triangulation: true;

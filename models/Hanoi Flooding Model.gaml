@@ -9,6 +9,8 @@ model HanoiFloodingModel
 global {
 	file river_shapefile <- file("../includes/RedRiver1925.shp");
 	file lakes_shapefile <- file("../includes/Lakes1925.shp");
+	file dykes_shape_file <- shape_file("../includes/Dykes.shp");
+
 	file buildings_shapefile <- file("../includes/Buildings1925.shp");
 	int resolution_grille <- 10 among: [10, 25, 40, 50];
 	file mnt_csv <- file("../includes/mnt-gz" + resolution_grille + ".csv");
@@ -135,7 +137,7 @@ global {
 			grid_value <- water_height;
 		}
 		save cell to: base_name + ".tif" format: "geotiff";
-		save cell to: base_name + ".csv" format: "csv";
+		//save cell to: base_name + ".csv" format: "csv";
 		write "Exported step " + cycle + " to " + base_name;
 	}
 
