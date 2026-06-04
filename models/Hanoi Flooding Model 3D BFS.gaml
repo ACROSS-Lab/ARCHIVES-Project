@@ -51,8 +51,8 @@ global {
 	bool is_raining <- false;
 	float rain <- 0.01 min: 0.0 max: 10.0 step: 0.01;                   // m / day
 	float water_inp <- 2.0 min: 0.0 max: 10.0 step: 1.0;               // m, initial river depth
-	float flow_rate <- 1000000.0 min: 0.0 max: 50000000.0 step: 100000.0; // m^3 / day
-	float evaporation <- 0.001 min: 0.0 max: 1.0 step: 0.001;          // m / day
+	float flow_rate <- 86400000.0 min: 0.0 max: 2592000000.0 step: 100000.0; // m^3 / day
+	float evaporation <- 0.001 min: 0.0 max: 0.005 step: 0.001;          // m / day
 	bool river_input <- true;
 
 	// BFS-specific parameters (from the Quang Binh model)
