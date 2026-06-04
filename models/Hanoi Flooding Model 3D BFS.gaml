@@ -23,12 +23,12 @@ global {
 	file lakes_shapefile <- file("../includes/Lakes1925.shp");
 	file buildings_shapefile <- file("../includes/Buildings1925.shp");
 	file dykes_shape_file <- shape_file("../includes/Dykes.shp");
-	float dyke_height <- 2.0 min: 0.0 max: 10.0 step: 0.5;             // m, uniform dyke barrier height
-	int resolution_grille <- 10 among: [10, 25, 40, 50];
+	float dyke_height <- 11.0 min: 0.0 max: 15.0 step: 0.5;             // m, uniform dyke barrier height
+	int resolution_grille <- 50 among: [10, 25, 40, 50];
 	file mnt_csv <- file("../includes/mnt-gz" + resolution_grille + ".csv");
 	geometry shape <- envelope("../includes/mnt-gz" + resolution_grille + ".asc");
-	int nb_cols <- resolution_grille = 10 ? 1283 : (resolution_grille = 25 ? 513 : (resolution_grille = 40 ? 321 : 257));
-	int nb_rows <- resolution_grille = 10 ? 854 : (resolution_grille = 25 ? 342 : (resolution_grille = 40 ? 214 : 171));
+	int nb_cols <- resolution_grille = 10 ? 1283 : (resolution_grille = 25 ? 513 : (resolution_grille = 40 ? 321 : 218));
+	int nb_rows <- resolution_grille = 10 ? 854 : (resolution_grille = 25 ? 342 : (resolution_grille = 40 ? 214 : 142));
 
 	float cell_area <- float(resolution_grille * resolution_grille);
 
@@ -401,7 +401,7 @@ experiment main_gui type: gui {
 	action _init_ {
 		int resolution <- 0;
 		loop while: (!(resolution in [10, 25, 40, 50])) {
-			map resolution_input <- user_input_dialog("Choose the resolution of the grid among 10, 25, 40, 50 meters", [choose("Choose a value", int, 10, [10, 25, 40, 50])]);
+			map resolution_input <- user_input_dialog("Choose the resolution of the grid among 10, 25, 40, 50 meters", [choose("Choose a value", int, 50, [10, 25, 40, 50])]);
 			resolution <- int(resolution_input["Choose a value"]);
 			if (resolution in [10, 25, 40, 50]) {
 				create simulation with: [resolution_grille::resolution];
@@ -412,13 +412,13 @@ experiment main_gui type: gui {
 	output {
 		display map type: opengl {
 			mesh elevation_map
-				scale: 10
+				scale: 1
 				grayscale: true
 				smooth: false
 				triangulation: true;
 
 			mesh water_field
-				scale: 10
+				scale: 1
 				color: rgb(100, 150, 255, 180)
 				smooth: false
 				triangulation: true;
