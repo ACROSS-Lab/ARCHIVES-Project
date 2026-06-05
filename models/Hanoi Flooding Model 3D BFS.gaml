@@ -181,6 +181,26 @@ global {
 		write "Run length: " + total_cycles + " cycles (" + total_days + " days at 1 h/step)";
 	}
 
+	// On the last day, export the final flood result to GeoTIFF (one band).
+	// Runs before pause_at_end (declaration order) so it fires at the final cycle.
+	reflex export_final when: cycle = total_cycles {
+		// Flood DEPTH map (m): 0 on dry land, positive where flooded.
+		ask cell {
+			grid_value <- is_inactive ? -9999.0 : water_height;
+		}
+		string depth_file <- export_dir + "water_depth_final_res" + resolution_grille + "_day" + total_days + ".tif";
+		save cell to: depth_file format: "geotiff";
+		write "Exported final flood DEPTH -> " + depth_file;
+
+		// Water SURFACE elevation (m) where wet, terrain elsewhere (= depth 0).
+		ask cell {
+			grid_value <- is_inactive ? -9999.0 : (altitude2 + water_height);
+		}
+		string surf_file <- export_dir + "water_surface_final_res" + resolution_grille + "_day" + total_days + ".tif";
+		save cell to: surf_file format: "geotiff";
+		write "Exported final water SURFACE -> " + surf_file;
+	}
+
 	reflex pause_at_end when: cycle >= total_cycles {
 		write "Reached " + total_days + " days. Pausing.";
 		do pause;
