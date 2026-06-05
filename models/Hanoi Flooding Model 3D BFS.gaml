@@ -32,7 +32,9 @@ global {
 
 	float cell_area <- float(resolution_grille * resolution_grille);
 
-	// Time
+	// Time. Anchored to July 1926 so the recorded breach dates (28-29 Jul) in
+	// Dykes.shp map onto simulation cycles. 15-day run covers 22 Jul - 6 Aug.
+	date starting_date <- date([1926, 7, 22, 0, 0, 0]);
 	float step <- 1 #h;
 	int total_days <- 15;
 	int total_cycles <- total_days * 24;
@@ -54,6 +56,28 @@ global {
 	float flow_rate <- 86400000.0 min: 0.0 max: 2592000000.0 step: 100000.0; // m^3 / day
 	float evaporation <- 0.001 min: 0.0 max: 0.005 step: 0.001;          // m / day
 	bool river_input <- true;
+
+	// Stage cap: historical 1926 Red River peak at the Hanoi (Long Bien) gauge.
+	// 11.93 m on 29-07-1926 was the level at which the left-bank dykes broke at
+	// Gia Quat / Ai Mo / Gia Lam. Used directly as a stage boundary: river cells
+	// cannot rise above it.
+	bool cap_river_stage <- true;
+	float max_river_stage <- 11.93 min: 0.0 max: 50.0 step: 0.01;       // m, water-surface elevation cap
+
+	// Dyke breach event (1926). The dykes are baked into the DEM (their crest is
+	// part of the terrain), so an 11.93 m surface cannot overtop them. A breach
+	// carves a notch through the BREAK=YES segment's footprint AND the levee-foot
+	// cells around it, dropping that terrain to the adjacent channel floor so
+	// water passes through regardless of the (high) DEM dyke crest.
+	bool enable_breaches <- true;
+	int breach_foot_radius <- 1 min: 0 max: 5;                          // cells around the breach also opened (levee foot)
+
+	// The SRTM DEM already contains the dyke crests as terrain, so the spread
+	// barrier must NOT add the_digue.height on top (that double-counts the dyke
+	// and needs ~2x the head to cross). Keep true for this DEM. Set false only
+	// if you switch to a bare-earth DEM where dykes are NOT in the terrain and
+	// the_digue.height must act as the barrier instead.
+	bool dem_contains_dykes <- true;
 
 	// BFS-specific parameters (from the Quang Binh model)
 	float flow_threshold <- 0.01 min: 0.0 max: 1.0 step: 0.001;        // m, min depth needed to spread
@@ -104,8 +128,15 @@ global {
 		// Dykes act as barriers. Each dyke's footprint cells store the_digue,
 		// and the spread check uses (terrain + the_digue.height) as the head
 		// water has to clear before flowing into the cell.
-		create digue from: dykes_shape_file with: [height::dyke_height];
-		write "Dyke segments created: " + length(digue) + " | dyke height = " + dyke_height + " m";
+		create digue from: dykes_shape_file with: [
+			height::dyke_height,
+			will_break::(string(read("BREAK")) = "YES"),
+			break_date_str::string(read("DATE")),
+			commune::string(read("Commune"))
+		];
+		write "Dyke segments created: " + length(digue)
+			+ " | breach segments (BREAK=YES): " + length(digue where each.will_break)
+			+ " | dyke height = " + dyke_height + " m";
 
 		create river from: river_shapefile {
 			cells_concerned <- cell overlapping self;
@@ -177,6 +208,26 @@ global {
 		}
 	}
 
+	// Hold the river at the 1926 historical stage: clamp each river cell's
+	// storage so its surface (altitude2 + water_height) cannot exceed
+	// max_river_stage. The surplus is what historically broke the dykes and
+	// spread onto the floodplain (which fills at naturally lower levels).
+	reflex apply_river_stage_cap when: cap_river_stage and river_input and !empty(river_cells) {
+		ask river_cells {
+			float cap_vol <- max(0.0, (world.max_river_stage - altitude2) * world.cell_area);
+			water_volume <- min(water_volume, cap_vol);
+		}
+	}
+
+	// Fire each historical breach once its recorded date is reached.
+	reflex trigger_dyke_breaches when: enable_breaches {
+		ask digue where (each.will_break and !each.has_broken and each.breach_date != nil) {
+			if (current_date >= breach_date) {
+				do break_dyke;
+			}
+		}
+	}
+
 	reflex adding_input_water {
 		loop so over: source {
 			int n <- length(so.cells_concerned);
@@ -200,7 +251,9 @@ global {
 				float donor_surface <- altitude2 + water_height;
 				list<cell> dry_targets <- active_neighbours where (!each.is_water);
 				ask dry_targets {
-					float my_top <- altitude2 + (the_digue = nil ? 0.0 : the_digue.height);
+					// DEM already includes the dyke crest; only add the_digue.height
+					// when the DEM is bare-earth (dem_contains_dykes = false).
+					float my_top <- altitude2 + ((world.dem_contains_dykes or the_digue = nil) ? 0.0 : the_digue.height);
 					float head_above_terrain <- donor_surface - my_top;
 					if (head_above_terrain > world.min_flow_diff) {
 						// Quang Binh rule: receiver lands just below donor's surface.
@@ -316,16 +369,64 @@ global {
 	species digue {
 		float height;
 		list<cell> cells_concerned;
+		bool will_break <- false;        // BREAK = "YES" in Dykes.shp
+		string break_date_str;           // DATE = "DD-MM" in Dykes.shp
+		string commune;
+		date breach_date;                // parsed absolute datetime of the breach
+		bool has_broken <- false;
 
 		init {
 			cells_concerned <- cell overlapping self;
 			ask cells_concerned {
 				the_digue <- myself;
 			}
+			// Parse the shapefile "DD-MM" into an absolute 1926 breach datetime.
+			if (will_break and break_date_str != nil and break_date_str != "") {
+				list<string> p <- break_date_str split_with "-";
+				if (length(p) >= 2) {
+					breach_date <- date([1926, int(p[1]), int(p[0]), 6, 0, 0]);
+				}
+			}
+		}
+
+		// Open a gap: the footprint + levee-foot cells (within breach_foot_radius)
+		// are dropped to the lowest adjacent ground (the channel floor) and lose
+		// their barrier flag, so water flows through regardless of the DEM crest.
+		action break_dyke {
+			has_broken <- true;
+			list<cell> footprint <- cells_concerned where !(each.is_inactive);
+			// Grow the breach outward by breach_foot_radius rings, using the cached
+			// radius-1 active_neighbours (neighbors_at with radius>1 throws on this
+			// grid type, so we expand iteratively instead).
+			list<cell> breach_cells <- footprint;
+			loop times: world.breach_foot_radius {
+				breach_cells <- remove_duplicates(breach_cells + (breach_cells accumulate (each.active_neighbours)));
+			}
+			breach_cells <- breach_cells where !(each.is_inactive);
+			// lowest surrounding ground that is NOT in the breach = the channel floor
+			list<cell> ring <- remove_duplicates(
+				breach_cells accumulate (each.active_neighbours)
+			) where !(breach_cells contains each);
+			float floor_alt <- empty(ring) ? (breach_cells min_of each.altitude2) : (ring min_of each.altitude2);
+			ask breach_cells {
+				the_digue <- nil;
+				altitude2 <- min(altitude2, floor_alt);
+				world.elevation_map[grid_x, grid_y] <- altitude2;
+			}
+			// Re-activate spreading: wet cells next to the new gap become edges.
+			ask breach_cells {
+				ask active_neighbours where (each.is_water and !each.is_edge_cell) {
+					is_edge_cell <- true;
+					world.edge_water_cells <- world.edge_water_cells + self;
+				}
+			}
+			height <- 0.0;
+			write "DYKE BREACH @ " + current_date + " | commune " + commune
+				+ " | opened " + length(breach_cells) + " cells down to " + floor_alt + " m";
 		}
 
 		aspect geometry {
-			draw shape color: rgb("red") depth: height;
+			draw shape color: (has_broken ? rgb("orange") : rgb("red")) depth: height;
 		}
 
 		action destroy_digue {
@@ -393,6 +494,11 @@ experiment main_gui type: gui {
 	parameter "River flow rate (m^3/day)" var: flow_rate;
 	parameter "Evaporation (m/day)" var: evaporation;
 	parameter "River input enabled" var: river_input;
+	parameter "Cap river at 1926 stage" var: cap_river_stage;
+	parameter "Max river stage (m)" var: max_river_stage;
+	parameter "Enable dyke breaches" var: enable_breaches;
+	parameter "Breach foot radius (cells)" var: breach_foot_radius;
+	parameter "DEM already contains dykes" var: dem_contains_dykes;
 	parameter "Dyke height (m)" var: dyke_height;
 	parameter "Flow threshold (m)" var: flow_threshold;
 	parameter "Min flow diff (m)" var: min_flow_diff;
