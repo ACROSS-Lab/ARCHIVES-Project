@@ -81,7 +81,7 @@ global {
 
 	// BFS-specific parameters (from the Quang Binh model)
 	float flow_threshold <- 0.01 min: 0.0 max: 1.0 step: 0.001;        // m, min depth needed to spread
-	float min_flow_diff <- 0.001 min: 0.0 max: 0.1 step: 0.0001;       // m, min surface-vs-terrain head to push
+	float min_flow_diff <- 0.000000001 min: 0.0 max: 0.1 step: 0.0000000001;       // m, min surface-vs-terrain head to push
 	float min_visible_depth <- 0.01;                                   // m, render threshold
 
 	string export_dir <- "../exported_results/";
@@ -152,6 +152,7 @@ global {
 			ask river_cells {
 				water_volume <- (initial_surface - altitude2) * world.cell_area;
 				is_water <- true;
+				is_river <- true;
 			}
 		}
 
@@ -333,6 +334,23 @@ global {
 		}
 	}
 
+	// Daily report: flood extent and water-height stats (1 day = 24 cycles).
+	reflex report_daily when: cycle mod 24 = 0 {
+		int day <- int(cycle / 24);
+		list<cell> wet <- active_cells where (each.water_height > min_visible_depth);
+		list<cell> flooded_land <- wet where !(each.is_river);
+		float depth_mean <- empty(flooded_land) ? 0.0 : (flooded_land mean_of each.water_height);
+		float depth_max  <- empty(wet) ? 0.0 : (wet max_of each.water_height);
+		float surf_max   <- empty(wet) ? 0.0 : (wet max_of (each.altitude2 + each.water_height));
+		write "=== Day " + day + " | " + current_date + " (cycle " + cycle + ") ===";
+		write "  Flood area (total wet) : " + ((length(wet) * cell_area / 10000.0) with_precision 1) + " ha"
+			+ " | (" + length(wet) + " cells)";
+		write "  Flood area (land only) : " + ((length(flooded_land) * cell_area / 10000.0) with_precision 1) + " ha"
+			+ " | (" + length(flooded_land) + " cells)";
+		write "  Water depth on land    : mean " + (depth_mean with_precision 2) + " m | max " + (depth_max with_precision 2) + " m";
+		write "  Max water surface elev : " + (surf_max with_precision 2) + " m";
+	}
+
 //	reflex export_water_height when: cycle mod 24 = 0 and cycle <= total_cycles {
 //		int day <- int(cycle / 24);
 //		string day_str <- (day < 10 ? "0" : "") + string(day);
@@ -460,6 +478,7 @@ global {
 
 		bool is_drain <- false;
 		bool is_water <- false;
+		bool is_river <- false;
 		bool is_edge_cell <- false;
 		float alt_norm <- 0.0;
 		digue the_digue;
