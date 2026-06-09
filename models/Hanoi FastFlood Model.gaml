@@ -16,12 +16,15 @@
 *   (2) Steady-state flow accumulation of the breach inflow  -> discharge AF  (Eq 1)
 *       plus AF(1) and AF(AF(1)) for the catchment-shape parameter
 *   (3) Manning inversion (Eq 2) + partial-steady-state compensation (Eq 3-14)
-*       -> per-cell shape b, s_max, s_ss, factor f_ss, compensated discharge q_c,
-*          and the first-guess steady-state flow height h_af
-*   (4) Adaptive diffusive-wave inundation refinement (Eq 15-19) on the REAL DEM,
-*       fed by a weir source at the breaches, draining at the OPEN domain edges,
-*       relaxed to equilibrium (inflow = outflow) with an artificial-velocity
-*       acceleration that ramps down to 1.
+*       -> per-cell shape b, s_max, s_ss (s_ss from the model's OWN mean velocity),
+*          factor f_ss, compensated discharge q_c, and the compensated steady-state
+*          flow height h_af. THIS field IS the flood estimate (steps 1-3 drive it).
+*   (4) Diffusive-wave inundation on the REAL DEM = paper's Eq 17 velocity + Eq 19
+*       h^(5/3) discharge-conserving update, flux-limited for stability. The floodplain
+*       starts DRY; the breach (held at the routed river stage) feeds it, so the flood
+*       SPREADS from the river and FILLS the polder — closed domain edges by default
+*       (the dijkring-41 storage case; set drain_edges for open through-flow). It self-
+*       limits when the basin level reaches the river stage. ('exact_eq19' = raw Jacobi.)
 *   (5) Arrival-time field along the flow network (seeded with the breach dates)
 *       -> arrival ORDER at the 5 observation points, vs the documented sequence.
 *
@@ -60,29 +63,52 @@ global {
 	float gravity   <- 9.81;
 	float min_depth <- 0.01;             // wet/dry threshold (m)
 
-	// -------------------------------------------- (4) breach weir source
+	// --------------------- discharge boundary: WaterDischarge.csv -> river stage
+	// Q_peak from the CSV is routed down the channel (Manning normal depth) to a
+	// north-inlet -> south-outlet water-surface profile; that stage drives the breach
+	// weir AND the foreland reservoir. (Replaces the hand-set peak stage.)
 	float weir_C  <- 1.7;                // broad-crested weir coeff (SI: Q = C*L*H^1.5)
-	float h_peak  <- 13.3;               // 1926 peak river stage (m) — calibration knob
+	float river_n <- 0.03;               // CHANNEL Manning n (for the Q -> stage routing)
+	float stage_cal <- 0.78;             // calibration multiplier (Q-routed ~17 m -> ~13.3 m known peak)
+	bool  allow_overtopping <- false;    // also exchange where the routed stage tops a (non-breach) dyke
+	float h_peak  <- 13.3;               // fallback inlet stage (m) if the CSV carries no Q
 	float h_base  <- 11.5;               // baseline stage (m) — context only
 	int   day0_july <- 22;               // discharge series starts 22 July 1926
-	float river_stage;                   // steady peak stage that drives the weir
-	float Q_peak;                        // peak river discharge (context, from CSV)
+	float river_stage;                   // representative (inlet) stage — set by compute_river_stage
+	float stage_north;                   // Q-driven stage at the north inlet (m)
+	float stage_south;                   // Q-driven stage at the south outlet (m)
+	float Q_peak;                        // peak river discharge from WaterDischarge.csv (drives the stage)
+	int   foreland_reach <- 50;          // flood-stage river fills this many cells inland (to the dykes)
 
 	// ------------------------------ (3) partial steady-state parameters
 	float event_days <- 8.0;             // representative event duration (days) for s_ss
-	float v_mean     <- 0.3;             // a-priori mean velocity (m/s): s_ss = v_mean * t
+	float v_mean     <- 0.3;             // mean flow velocity (m/s) — recomputed from the field
+	float fss_event  <- 1.0;             // discharge-weighted event compensation (scales the source)
 
 	// --------------------------------------- (4) diffusive relaxation
 	// Gauss-Seidel, flux-limited redistribution: each transfer is capped to a
 	// quarter of the head difference and to the water available, so it stays
 	// stable on flat ground (an explicit diffusive update blows up there).
-	int   iters_per_cycle <- 3;          // redistribution passes per displayed cycle
-	float relax_dt  <- 2.0;              // pseudo-step (s); the caps keep it stable for any value
-	int   max_cycles <- 800;
-	int   cycle <- 0;                    // RELAXATION ITERATION counter — NOT real time
-	float conv_tol  <- 0.005;            // converged when max |dh| per cycle < this (m)
+	// NB: 'cycle' is a GAMA BUILT-IN (the sim step), so the relaxation counter
+	// must be named something else -> relax_iter.
+	int   iters_per_cycle <- 6;          // redistribution passes per displayed cycle
+	float relax_dt  <- 8.0;              // pseudo-step (s); the caps keep it stable for any value
+	// false = POLDER / basin-fill (closed edges -> the flood spreads in and fills, like the
+	//   paper's dijkring-41 levee case); true = open downstream boundary (through-flow/conveyance).
+	bool  drain_edges <- false;
+	bool  exact_eq19 <- false;           // true -> paper-literal Eq 17/19 update (fragile); false -> stable GS
+	float eq19_dt   <- 0.5;              // explicit step (s) for the exact_eq19 mode (keep small)
+	int   max_cycles <- 3000;            // hard cap — we still finalize (report) when hit
+	int   relax_iter <- 0;               // relaxation counter — NOT real time
+	float conv_tol  <- 0.02;             // depth-converged when max |dh| per cycle < this (m)
 	float max_dh <- 1.0;                 // convergence monitor (max |dh| this cycle)
+	// flood-EXTENT convergence: stop when the inundated footprint stops growing,
+	// because depth keeps creeping up long after the extent (what we care about) settles.
+	int   wet_prev <- -1;
+	int   stable_count <- 0;
+	int   stable_needed <- 15;           // consecutive extent-stable cycles to call it settled
 	bool  converged <- false;
+	bool  flag_disconnect <- false;      // when true, recolor paints truly-disconnected wet cells red
 
 	// --------------------------------------- precomputed cell sets
 	list<cell> breach_cells <- [];
@@ -117,6 +143,7 @@ global {
 		create dyke_seg from: dykes_file with: [
 			brk::string(read("BREAK")), dnum_s::string(read("DATE")), commune::string(read("Commune"))
 		];
+		ask dyke_seg { ask cell overlapping self { is_dyke <- true; } }   // whole dyke line = barrier
 		ask dyke_seg where (each.brk = "YES") {
 			int dday <- int(first(dnum_s split_with "-"));   // "28-07" -> 28
 			open_time <- (dday - myself.day0_july) * 86400.0;
@@ -133,8 +160,11 @@ global {
 		// Held at the river stage and EXCLUDED from floodplain redistribution, so the
 		// river feeds the protected area ONLY through the breach weir (dykes hold).
 		create river_area from: river_file;
-		ask river_area { ask cell overlapping self { is_river <- true; } }
-		write "River cells: " + length(cell where each.is_river);
+		ask river_area { ask cell overlapping self { is_river <- true; is_channel <- true; } }
+		do route_channel;          // inject Q at the inlet, route N->S with continuity (sets rstage + q_in spill)
+		do build_reservoir;        // grow the channel out to the dykes (using the routed stage)
+		write "River + foreland reservoir cells: " + length(cell where each.is_river)
+			+ "  (channel grown " + foreland_reach + " cells max to the dyke line)";
 
 		// --- observation points (record order = ids 1..5) ---
 		list<arrival_pt> pts <- [];
@@ -152,8 +182,8 @@ global {
 		write "[1/4] Fast-Sweeping DEM hydro-correction ...";
 		do correct_dem;            // (1) depression-free zc
 		do velocity_field;         // (2a) flow directions + accumulation weights (Eq 23)
-		do compute_weir_source;    // breach inflow discharge per cell
-		write "[2/4] Steady-state flow accumulation ...";
+		// (breach source q_in already set by route_channel = the river spill, with continuity)
+		write "[2/4] Steady-state flow accumulation of the river spill ...";
 		do accumulate_field(1);    // AF(1)  : upstream cell count
 		do accumulate_field(2);    // AF(AF(1))
 		do accumulate_field(0);    // AF(q)  : steady-state discharge from the breach (Eq 1)
@@ -231,15 +261,89 @@ global {
 		}
 	}
 
-	// breach inflow discharge per cell: weir over the dyke crest (= cell elevation)
-	action compute_weir_source {
-		ask cell { q_in <- 0.0; }
-		ask breach_cells {
-			float head <- max(0.0, myself.river_stage - z);
-			q_in <- myself.weir_C * myself.dx * (head ^ 1.5);   // m3/s entering this cell
+	// grow the river reservoir from the channel out to the dyke line: take every low
+	// cell (z < stage) 4-connected to the channel, stopping at dyke cells and high
+	// ground. Bounded to 'foreland_reach' rings so a gap in the dyke ring can't run away.
+	action build_reservoir {
+		loop k from: 1 to: foreland_reach {
+			list<cell> grow <- [];
+			ask cell where (each.active and not each.is_river and not each.is_dyke and each.z < each.rstage) {
+				if ((nE != nil and nE.is_river) or (nW != nil and nW.is_river)
+				  or (nS != nil and nS.is_river) or (nN != nil and nN.is_river)) {
+					add self to: grow;
+				}
+			}
+			if (empty(grow)) { break; }
+			ask grow { is_river <- true; }
 		}
-		write "Total breach inflow Q = " + (breach_cells sum_of each.q_in) with_precision 1
-			+ " m3/s  (peak river Q on record = " + Q_peak + " m3/s)";
+	}
+
+	// --------------------- DISCHARGE-BOUNDARY river-corridor routing ---------------------
+	// Strict version of the paper's discharge BC: inject Q_total at the north inlet and
+	// sweep DOWNSTREAM (north -> south) station by station (one grid_y row of channel cells
+	// = one cross-section). At each station:
+	//   stage = bed + Manning normal depth for the CURRENT channel discharge & local width;
+	//   breach/overtopping spill = weir(stage - crest)  -> becomes the floodplain source q_in;
+	//   CONTINUITY: the channel discharge is reduced by that spill before the next station.
+	// The remaining discharge leaves at the south outlet. So the stage is locally varying and
+	// the river loses water as it spills (true 1D-channel-with-lateral-outflow + 2D floodplain).
+	action route_channel {
+		ask cell { q_in <- 0.0; rstage <- 0.0; }
+		list<cell> chan <- cell where each.is_channel;
+		if (empty(chan)) {
+			// no channel cells: fall back to a flat stage and a weir at the mapped breaches
+			ask cell { rstage <- h_peak; }
+			ask breach_cells { q_in <- myself.weir_C * myself.dx * (max(0.0, h_peak - z) ^ 1.5); }
+			stage_north <- h_peak; stage_south <- h_peak; river_stage <- h_peak;
+		} else {
+			int ymin <- chan min_of each.grid_y;                 // north inlet (top row)
+			int ymax <- chan max_of each.grid_y;                 // south outlet (bottom row)
+			float len <- max(dx, (ymax - ymin) * dx);
+			float bed_n <- (chan where (each.grid_y <= ymin + 2)) mean_of each.z;
+			float bed_s <- (chan where (each.grid_y >= ymax - 2)) mean_of each.z;
+			float Sc <- max(1e-4, abs(bed_n - bed_s) / len);     // channel longitudinal slope
+			float Qch <- (Q_peak > 0.0) ? Q_peak : (weir_C * 1000.0);
+			float Qin0 <- Qch;
+			float st <- bed_n;                                   // running stage (carried through gaps)
+			stage_north <- 0.0; stage_south <- 0.0;
+			loop gy from: ymin to: ymax {
+				list<cell> row <- chan where (each.grid_y = gy);
+				if (not empty(row)) {
+					float Wrow <- max(dx, length(row) * dx);     // channel width at this station (m)
+					float bedrow <- row mean_of each.z;
+					float d <- stage_cal * ((Qch * river_n / (Wrow * sqrt(Sc))) ^ 0.6);   // normal depth
+					st <- bedrow + d;
+					if (stage_north = 0.0) { stage_north <- st; }
+					stage_south <- st;
+				}
+				// local river stage along this station (carried st where the channel is absent)
+				ask cell where (each.grid_y = gy) { rstage <- st; }
+				// overtopping: non-breach dyke cells topped by the stage become spill points
+				if (allow_overtopping) {
+					ask cell where (each.is_dyke and not each.is_breach and each.grid_y = gy and (st > each.z + 0.1)) {
+						is_breach <- true; breach_open <- 0.0;
+					}
+				}
+				// spill through breach/overtop cells at this station (weir) -> floodplain source
+				ask cell where (each.is_breach and each.grid_y = gy) {
+					q_in <- myself.weir_C * myself.dx * (max(0.0, st - z) ^ 1.5);
+				}
+				float spill_raw <- (cell where (each.is_breach and each.grid_y = gy)) sum_of each.q_in;
+				// CONTINUITY: cannot spill more than is left in the channel -> cap & rescale
+				float spill <- min(spill_raw, Qch);
+				if (spill_raw > spill and spill_raw > 0.0) {
+					float fac <- spill / spill_raw;
+					ask cell where (each.is_breach and each.grid_y = gy) { q_in <- q_in * fac; }
+				}
+				Qch <- Qch - spill;                              // river loses exactly the (capped) spill
+			}
+			river_stage <- max(stage_north, stage_south);
+			breach_cells <- cell where each.is_breach;
+			write "Channel routing: inlet stage=" + (stage_north with_precision 1) + " m, outlet="
+				+ (stage_south with_precision 1) + " m;  Q in=" + (Qin0 with_precision 0)
+				+ " -> out=" + (Qch with_precision 0) + " m3/s;  total spill to floodplain="
+				+ ((breach_cells sum_of each.q_in) with_precision 0) + " m3/s";
+		}
 	}
 
 	// =====================================================================
@@ -291,6 +395,7 @@ global {
 	// compensated discharge q_c (Eq 14), and first-guess height h_af (Eq 2).
 	// =====================================================================
 	action compensate {
+		// --- catchment shape b (Eq 4 & 6) and s_max, per cell (independent of v_mean) ---
 		ask cell where each.active {
 			float bsol <- 0.5;
 			if (af1 > 1.0) {
@@ -306,60 +411,109 @@ global {
 			}
 			bshape <- bsol;
 			smax <- dx * (af1 ^ (1.0 / (1.0 + bshape)));              // Eq 6 rearranged
-			sss  <- v_mean * (event_days * 86400.0);                 // event travel distance
-			float sn <- (smax > 0.0) ? min(1.0, sss / smax) : 1.0;
-			fss  <- (smax > sss) ? (sn ^ (1.0 + bshape)) : 1.0;      // Eq 12-13
-			qc   <- fss * af;                                        // Eq 14 (af is already vol/time)
-			float S <- max(slope, 1e-4);
-			h_af <- (qc > 0.0) ? (((qc * manning) / (dx * sqrt(S))) ^ 0.6) : 0.0;   // Eq 2
 		}
+		// --- f_ss, q_c, h_af; iterate twice so s_ss uses the model's OWN mean velocity ---
+		//     (the paper: "s_ss estimated using the duration of the event and the average
+		//      flow velocities" — not an a-priori constant).
+		loop pass from: 1 to: 2 {
+			ask cell where each.active {
+				sss  <- v_mean * (event_days * 86400.0);                 // event travel distance
+				float sn <- (smax > 0.0) ? min(1.0, sss / smax) : 1.0;
+				fss  <- (smax > sss) ? (sn ^ (1.0 + bshape)) : 1.0;      // Eq 12-13
+				qc   <- fss * af;                                        // Eq 14 (af is already vol/time)
+				float S <- max(slope, 1e-4);
+				h_af <- (qc > 0.0) ? (((qc * manning) / (dx * sqrt(S))) ^ 0.6) : 0.0;   // Eq 2
+			}
+			// discharge-weighted mean Manning velocity  v = (1/n) h_af^(2/3) sqrt(S)
+			float wsum <- (cell where each.active) sum_of (each.af);
+			if (wsum > 0.0) {
+				float vw <- (cell where each.active) sum_of
+					(each.af * (1.0 / manning) * (each.h_af ^ 0.6667) * sqrt(max(each.slope, 1e-4)));
+				v_mean <- max(0.05, min(5.0, vw / wsum));
+			}
+		}
+		// representative event compensation (discharge-weighted) -> scales the sustained source
+		float wsum2 <- (cell where each.active) sum_of (each.af);
+		fss_event <- (wsum2 > 0.0) ? ((cell where each.active) sum_of (each.fss * each.af)) / wsum2 : 1.0;
+		write "Compensation: mean v = " + (v_mean with_precision 2) + " m/s, s_ss = "
+			+ ((v_mean * event_days * 86400.0) / 1000.0) with_precision 1
+			+ " km, event f_ss = " + (fss_event with_precision 3);
 	}
 
-	// start dry; the breach weir source fills the basin during relaxation.
-	// (h_af from step 3 is kept as the FastFlood steady-state estimate / output,
-	//  but is NOT used as the seed — on flat ground its slope->0 makes it ill-posed.)
+	// Floodplain starts DRY so the flood visibly SPREADS from the breaches and FILLS the
+	// polder (basin-fill mode); the diffusive solver does the spreading. The river channel
+	// + foreland are filled to the routed stage = the source reservoir behind the dykes.
+	// (h_af from steps 1-3 is still computed as the steady-state estimate / for the velocity
+	//  field, but is not used as the seed — the fill is what the user wants to watch.)
 	action seed_inundation {
 		ask cell where each.active { h <- 0.0; hmax <- 0.0; }
-		// fill the river channel to the stage (display + the head the weir sees)
 		ask cell where (each.is_river and not each.is_breach) {
-			h <- max(0.0, myself.river_stage - z);
+			h <- max(0.0, rstage - z);
 			hmax <- h;
 		}
 	}
 
 	// =====================================================================
-	// (4) ADAPTIVE DIFFUSIVE-WAVE INUNDATION (Eq 15-19) — displayed relaxation
-	// Two-phase per iteration: compute face discharges (analytic Manning velocity,
-	// Eq 17, water-surface form), then update depth by mass balance with the breach
-	// source and free outflow at the open domain edges. Acceleration ramps to 1.
+	// (4) DIFFUSIVE-WAVE REFINEMENT (Eq 15-19) — relax seeded h_af to steady state
+	// Each cycle: hold the fixed-head BOUNDARIES (river/foreland reservoir + the breach
+	// at the f_ss-scaled stage), then sweep wet cells (highest surface first) and
+	// redistribute to lower neighbours with the flux-limited Manning flux. The breach
+	// is a boundary, re-held each pass; from a DRY floodplain it spreads in and FILLS the
+	// polder (domain edges are walls unless drain_edges) until the basin reaches the river
+	// stage. relax_dt sets only the speed. Converges on FLOODPLAIN depth/extent stability.
 	// =====================================================================
-	reflex relax when: not converged and cycle < max_cycles {
+	reflex relax when: not converged and relax_iter < max_cycles {
 		ask cell where each.active { h_prev <- h; }
-		// hold the river channel at its stage (Dirichlet reservoir)
-		ask cell where (each.is_river and not each.is_breach) { h <- max(0.0, river_stage - z); }
-		loop times: iters_per_cycle {
-			// inject the breach weir inflow (discharge -> depth) ...
-			ask breach_cells {
-				h <- h + relax_dt * q_in / (dx * dx);
-				if (h > hmax) { hmax <- h; }
+		// fixed-head boundary: river channel + foreland at the stage (Dirichlet reservoir)
+		ask cell where (each.is_river and not each.is_breach) { h <- max(0.0, rstage - z); }
+		if (exact_eq19) {
+			// ---- paper-literal mode: Eq 17 velocity (potential z + 1/2 h^2) + Eq 19
+			//      (h^(5/3) discharge-conserving) two-phase Jacobi update. No flux limiter. ----
+			loop times: iters_per_cycle {
+				ask breach_cells { h <- fss_event * max(0.0, rstage - z); }
+				ask cell where (each.active and not each.is_river and not (each.is_dyke and not each.is_breach))
+					parallel: true { do flux_eq17; }
+				ask cell where (each.active and not each.is_river and not each.is_dyke)
+					parallel: true { do update_eq19; }
 			}
-			// ... then push water downhill, highest water-surface first, so it
-			// cascades in one Gauss-Seidel pass (sequential -> race-free, stable).
-			// River cells are excluded (reservoir feeds only via the breach weir).
-			list<cell> wet <- (cell where (each.active and each.h > min_depth
-				and (each.is_breach or not each.is_river))) sort_by (-(each.z + each.h));
-			ask wet { do redistribute; }
+		} else {
+			// ---- stable mode: flux-limited Gauss-Seidel, highest water-surface first.
+			//      Recompute the wet set EACH pass so the flood FRONT advances every iteration
+			//      (filling a polder needs the front to travel far; once-per-cycle made it
+			//      crawl). Non-breach dyke cells are walls (excluded here AND in redistribute). ----
+			loop times: iters_per_cycle {
+				// breach = fixed-head boundary (f_ss-scaled river stage), re-held each pass.
+				ask breach_cells { h <- fss_event * max(0.0, rstage - z); if (h > hmax) { hmax <- h; } }
+				list<cell> wet <- (cell where (each.active and each.h > min_depth
+					and (each.is_breach or (not each.is_river and not each.is_dyke)))) sort_by (-(each.z + each.h));
+				ask wet { do redistribute; }
+			}
 		}
-		max_dh <- (cell where each.active) max_of (abs(each.h - each.h_prev));
-		cycle <- cycle + 1;
-		if (cycle > 2 and max_dh < conv_tol) { do finalize; }
+		// convergence on the FLOODPLAIN depth (the held boundaries are excluded)
+		max_dh <- (cell where (each.active and not each.is_breach and not each.is_river))
+			max_of (abs(each.h - each.h_prev));
+		relax_iter <- relax_iter + 1;
+		// flood-extent convergence
+		int wet_now <- cell count (each.active and each.h > min_depth and not each.is_river);
+		if (wet_prev >= 0 and abs(wet_now - wet_prev) <= max(3, int(0.001 * wet_now))) {
+			stable_count <- stable_count + 1;
+		} else { stable_count <- 0; }
+		wet_prev <- wet_now;
+		// POLDER fill: converge when DEPTH settles (basin actually full). Conveyance: when
+		// EXTENT settles (depth there creeps forever). The hard cap always finalizes too.
+		bool done <- drain_edges ? (stable_count >= stable_needed) : (max_dh < conv_tol);
+		if (relax_iter > 5 and (done or relax_iter >= max_cycles - 1)) { do finalize; }
 		do recolor;
 	}
 
 	action recolor {
 		ask cell where each.active parallel: true {
 			if (h > min_depth) {
-				color <- rgb(0, int(max(40, 170 - h * 18)), 255);            // blue, darker = deeper
+				if (flag_disconnect and not connected and not is_river) {
+					color <- #red;                                          // wet but NO path back to a breach/river
+				} else {
+					color <- rgb(0, int(max(40, 170 - h * 18)), 255);       // blue, darker = deeper
+				}
 			} else {
 				color <- base_color;
 			}
@@ -384,8 +538,12 @@ global {
 			} else { vmag <- 0.0; }
 		}
 		do arrival_time;
+		do check_connectivity;       // diagnostic: are there any truly-floating wet cells?
+		flag_disconnect <- true;
+		do recolor;                  // paint disconnected wet cells red, if any
 		do report;
-		write "Converged after " + cycle + " cycles (max dh = " + max_dh + " m). Paused.";
+		write "Settled after " + relax_iter + " relaxation iters (max depth change "
+			+ (max_dh with_precision 4) + " m/iter). Paused.";
 		do pause;
 	}
 
@@ -403,7 +561,8 @@ global {
 					loop iy from: 0 to: nb_rows - 1 {
 						int gy <- ry ? (nb_rows - 1 - iy) : iy;
 						cell c <- cell grid_at {gx, gy};
-						if (c.active and not c.is_breach) {
+						// only a cell that is itself FLOODED can have an arrival time
+						if (c.active and not c.is_breach and c.h > min_depth) {
 							float best <- c.t_arr;
 							loop nb over: [c.nW, c.nE, c.nN, c.nS] {
 								if (nb != nil and nb.active and nb.t_arr < BIG and nb.h > min_depth and nb.vmag > 1e-3) {
@@ -417,6 +576,33 @@ global {
 				}
 			}
 		}
+	}
+
+	// DIAGNOSTIC: flood-fill connectivity from the breaches/river through wet cells.
+	// Any wet floodplain cell with no such path is genuinely floating (a bug) -> red.
+	action check_connectivity {
+		ask cell where each.active { connected <- (is_river or is_breach); }
+		loop r from: 0 to: sweep_rounds - 1 {
+			loop dir from: 0 to: 3 {
+				bool rx <- (dir = 1 or dir = 3);
+				bool ry <- (dir = 2 or dir = 3);
+				loop ix from: 0 to: nb_cols - 1 {
+					int gx <- rx ? (nb_cols - 1 - ix) : ix;
+					loop iy from: 0 to: nb_rows - 1 {
+						int gy <- ry ? (nb_rows - 1 - iy) : iy;
+						cell c <- cell grid_at {gx, gy};
+						if (c.active and c.h > min_depth and not c.connected) {
+							loop nb over: [c.nW, c.nE, c.nN, c.nS] {
+								if (nb != nil and nb.active and nb.connected and nb.h > min_depth) { c.connected <- true; }
+							}
+						}
+					}
+				}
+			}
+		}
+		int discon <- cell count (each.active and each.h > min_depth and not each.is_river and not each.connected);
+		write "Connectivity check: " + discon + " wet cell(s) have NO path back to a breach/river"
+			+ (discon = 0 ? "  -> ALL flood water is connected (thin links can hide it visually)." : "  -> shown in RED.");
 	}
 
 	action report {
@@ -470,12 +656,17 @@ grid cell file: dem_file neighbors: 4 frequency: 0
 	float vmag;              // velocity magnitude at peak (m/s)
 	float t_arr <- 1e12;     // flood arrival time (s)
 	float h_prev;            // depth at start of cycle (convergence check)
+	float FE; float FS;      // h^(5/3)-flux on the E and S faces (exact_eq19 mode)
+	float rstage;            // local river water-surface elevation (Q-driven, N->S profile)
 
 	bool active   <- true;
 	bool is_edge  <- false;
 	bool is_breach <- false;
-	bool is_river  <- false;     // river channel: fixed-stage reservoir (the source side)
+	bool is_dyke   <- false;     // any dyke cell — a barrier for the flood-stage foreland fill
+	bool is_channel <- false;    // the river CHANNEL (RedRiver polygon) — used to route Q -> stage
+	bool is_river  <- false;     // channel + flood-stage foreland: fixed-stage reservoir (source side)
 	bool is_sample <- false;
+	bool connected <- false;     // diagnostic: has a wet path back to a breach / the river
 	int  sample_id <- 0;
 	float breach_open <- -1.0;   // breach opening time (s since day0)
 
@@ -483,31 +674,42 @@ grid cell file: dem_file neighbors: 4 frequency: 0
 	rgb color <- #gray;
 	cell nE; cell nW; cell nS; cell nN;
 
-	// Gauss-Seidel diffusive redistribution (Eq 15-19, flux-limited form).
-	// Push water to every lower-water-surface neighbour with the Manning flux
-	//   q = (1/n) hflow^(5/3) sqrt(Sw),   capped to:
-	//   (a) a quarter of the head difference  -> no overshoot, stable on flat ground;
-	//   (b) the water actually available      -> depth never goes negative.
+	// Gauss-Seidel DIFFUSIVE-WAVE redistribution = the paper's Eq 17 + Eq 19.
+	// Eq 17 velocity (Manning, driven by the WATER-SURFACE slope d(z+h)/dx — the
+	//   dimensionally-correct reading of the pressure term; the printed d(1/2 h^2)/dx
+	//   is a mis-render, since z is a slope and 1/2 h^2 is metres):
+	//     u = (hflow^(2/3)/n) * sqrt(Sw),   Sw = (etaC - etaN)/dx
+	// Eq 19 conserves the DISCHARGE quantity psi = h^(5/3) (not depth): we transfer psi,
+	//   so h is NOT volume-conserved (the paper's explicit choice). Flux-limited by:
+	//   (a) a quarter of the head difference (no overshoot) and (b) the water available.
 	// A missing/inactive neighbour is free outfall (open boundary): outside eta = bed.
 	action redistribute {
 		if (h > min_depth) {
 			loop nb over: [nE, nW, nS, nN] {
-				float etaC <- z + h;
-				float zN <- z; float etaN <- z; bool outside <- true;
-				if (nb != nil and nb.active) { zN <- nb.z; etaN <- nb.z + nb.h; outside <- false; }
-				if (etaC > etaN) {
-					float hf <- etaC - max(z, zN);
-					if (hf > min_depth) {
-						float dhead <- etaC - etaN;
-						float q  <- (hf ^ 1.6667) / manning * sqrt(dhead / dx);   // m2/s
-						float dV <- relax_dt * q / dx;                            // depth (m)
-						dV <- min(dV, 0.25 * dhead);                              // no overshoot
-						dV <- min(dV, h - min_depth);                             // keep depth >= 0
-						if (dV > 0.0) {
-							h <- h - dV;
-							if (not outside) {
-								nb.h <- nb.h + dV;
-								if (nb.h > nb.hmax) { nb.hmax <- nb.h; }
+				// non-breach dyke cells are WALLS (dykes hold except at breaches); the domain
+				// edge is a wall too unless drain_edges (POLDER fill vs open-conveyance).
+				bool wall <- (nb != nil and nb.is_dyke and not nb.is_breach);
+				bool isedge <- (nb = nil or not nb.active);
+				if (not wall and (not isedge or drain_edges)) {
+					float etaC <- z + h;
+					float zN   <- isedge ? z : nb.z;                          // open edge: outside surface = bed
+					float etaN <- isedge ? z : (nb.z + nb.h);
+					if (etaC > etaN) {
+						float hf <- etaC - max(z, zN);
+						if (hf > min_depth) {
+							float dhead <- etaC - etaN;                               // Eq-17 water-surface slope
+							float u  <- (hf ^ 0.6667) / manning * sqrt(dhead / dx);   // Eq-17 velocity (m/s)
+							float dpsi <- relax_dt * (h ^ 1.6667) * u / dx;           // Eq-19 flux of psi = h^(5/3)
+							// flux limiter (the paper's flux-to-volume cap), via the equivalent depth:
+							float dVcap <- min(0.25 * dhead, h - min_depth);          // no overshoot + available
+							float dpsicap <- (h ^ 1.6667) - ((h - dVcap) ^ 1.6667);
+							dpsi <- min(dpsi, dpsicap);
+							if (dpsi > 0.0) {
+								h <- (max(0.0, (h ^ 1.6667) - dpsi)) ^ 0.6;           // Eq-19: C loses psi
+								if (not isedge) {
+									nb.h <- ((nb.h ^ 1.6667) + dpsi) ^ 0.6;           // N gains the same psi
+									if (nb.h > nb.hmax) { nb.hmax <- nb.h; }
+								}
 							}
 						}
 					}
@@ -515,6 +717,53 @@ grid cell file: dem_file neighbors: 4 frequency: 0
 			}
 			if (h > hmax) { hmax <- h; }
 		}
+	}
+
+	// -------- paper-literal Eq 17 / Eq 19 update (optional 'exact_eq19' mode) --------
+	// Eq 17 analytic velocity with the depth-integrated pressure potential phi = z + 1/2 h^2:
+	//   u = sign(G) * (hflow^(2/3)/n) * sqrt(|G|),   G = -d(phi)/dx
+	// Phase 1 stores the h^(5/3)-flux on the E and S faces (upwind). No flux limiter, so it
+	// can go unstable on flat ground -> h is clamped to 50 m so instability is visible, not NaN.
+	action flux_eq17 {
+		// EAST face
+		bool edgeE <- (nE = nil or not nE.active);
+		bool wallE <- edgeE ? (not drain_edges) : (nE.is_river or (nE.is_dyke and not nE.is_breach));
+		if (wallE) { FE <- 0.0; }
+		else {
+			float zN <- edgeE ? z : nE.z;          // open edge: outside surface = bed (free outfall)
+			float hN <- edgeE ? 0.0 : nE.h;
+			float G  <- -(((zN + 0.5 * hN * hN) - (z + 0.5 * h * h)) / dx);
+			float hface <- max(z + h, zN + hN) - max(z, zN);
+			if (hface > min_depth and abs(G) > 1e-12) {
+				float u <- ((G > 0.0) ? 1.0 : -1.0) * (hface ^ 0.6667) / manning * sqrt(abs(G));
+				FE <- ((u >= 0.0) ? (h ^ 1.6667) : (hN ^ 1.6667)) * u;
+			} else { FE <- 0.0; }
+		}
+		// SOUTH face
+		bool edgeS <- (nS = nil or not nS.active);
+		bool wallS <- edgeS ? (not drain_edges) : (nS.is_river or (nS.is_dyke and not nS.is_breach));
+		if (wallS) { FS <- 0.0; }
+		else {
+			float zN2 <- edgeS ? z : nS.z;
+			float hN2 <- edgeS ? 0.0 : nS.h;
+			float G2  <- -(((zN2 + 0.5 * hN2 * hN2) - (z + 0.5 * h * h)) / dx);
+			float hface2 <- max(z + h, zN2 + hN2) - max(z, zN2);
+			if (hface2 > min_depth and abs(G2) > 1e-12) {
+				float u2 <- ((G2 > 0.0) ? 1.0 : -1.0) * (hface2 ^ 0.6667) / manning * sqrt(abs(G2));
+				FS <- ((u2 >= 0.0) ? (h ^ 1.6667) : (hN2 ^ 1.6667)) * u2;
+			} else { FS <- 0.0; }
+		}
+	}
+
+	// Phase 2: Eq 19 conservative update of psi = h^(5/3), then h = psi^(3/5).
+	action update_eq19 {
+		float psi <- h ^ 1.6667;
+		float Fw <- (nW != nil and nW.active) ? nW.FE : 0.0;   // flux from west face into me
+		float Fn <- (nN != nil and nN.active) ? nN.FS : 0.0;   // flux from north face into me
+		float net <- (Fw - FE) + (Fn - FS);
+		float psinew <- max(0.0, psi + eq19_dt * net / dx);
+		h <- min(50.0, psinew ^ 0.6);                          // clamp so instability is visible, not NaN
+		if (h > hmax) { hmax <- h; }
 	}
 }
 
@@ -540,12 +789,19 @@ species river_area {
 }
 
 experiment HanoiFastFlood type: gui {
-	parameter "Manning n"              var: manning      min: 0.02 max: 0.12 step: 0.005;
-	parameter "Peak river stage (m)"   var: h_peak       min: 11.5 max: 16.0 step: 0.1;
+	parameter "Manning n (floodplain)" var: manning      min: 0.02 max: 0.12 step: 0.005;
 	parameter "Weir coefficient C"     var: weir_C       min: 1.0  max: 2.2  step: 0.05;
+	parameter "Foreland reach (cells)" var: foreland_reach min: 0 max: 120 step: 2;
 	parameter "Hydro-correct slope (m/cell)" var: delta_slope min: 0.0001 max: 0.01 step: 0.0005;
 	parameter "Event duration (days)"  var: event_days   min: 1.0  max: 16.0 step: 1.0;
 	parameter "Relaxation dt (s)"      var: relax_dt     min: 0.5  max: 20.0 step: 0.5;
+	parameter "Drain at edges (conveyance vs polder fill)" var: drain_edges;
+	parameter "Channel Manning n"        var: river_n     min: 0.02 max: 0.06 step: 0.005 category: "Discharge boundary";
+	parameter "Stage calibration x"      var: stage_cal   min: 0.5  max: 1.5  step: 0.05  category: "Discharge boundary";
+	parameter "Allow overtopping"        var: allow_overtopping category: "Discharge boundary";
+	parameter "Stage fallback (no Q, m)" var: h_peak      min: 11.5 max: 16.0 step: 0.1   category: "Discharge boundary";
+	parameter "Exact Eq-17/19 solver"  var: exact_eq19   category: "Compare: paper-literal (fragile)";
+	parameter "  Eq-19 dt (s)"         var: eq19_dt      min: 0.05 max: 2.0  step: 0.05 category: "Compare: paper-literal (fragile)";
 
 	output {
 		display "Flood depth" type: 2d {
@@ -554,13 +810,14 @@ experiment HanoiFastFlood type: gui {
 			species dyke_seg aspect: default;
 			species arrival_pt aspect: default;
 			overlay position: {10, 10} size: {340 #px, 80 #px} background: #black transparency: 0.5 {
-				draw "relaxation iter " + world.cycle + (world.converged ? "  (converged)" : "  (solving)")
+				draw "relaxation iter " + world.relax_iter + (world.converged ? "  (settled)" : "  (solving)")
 					at: {15 #px, 24 #px} color: #white font: font("Helvetica", 13, #bold);
 				draw "max change " + (world.max_dh with_precision 4) + " m   (steady-state solver, not a clock)"
 					at: {15 #px, 48 #px} color: rgb(185, 185, 185) font: font("Helvetica", 11, #plain);
 			}
 		}
-		monitor "Relaxation iter"  value: cycle;
+		monitor "Relaxation iter"  value: relax_iter;
+		monitor "Extent-stable cycles" value: stable_count;
 		monitor "Converged?"       value: converged;
 		monitor "Max |dh| (m)"     value: max_dh with_precision 4;
 		monitor "Wet cells"        value: cell count (each.active and each.h > min_depth);
