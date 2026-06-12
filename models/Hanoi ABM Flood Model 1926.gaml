@@ -51,10 +51,11 @@ global {
 	// DEM: only mnt-gz50.asc / mnt-gz25.asc hold the archival MNT (z 1.9..16.1 m, same datum as the
 	// 1926 gauge). mnt-gz50.asc and mnt-gz10.asc were overwritten with a modern DEM (z -2.6..43 m,
 	// stale .aux.xml statistics) whose datum is inconsistent with the stage record - do not use them.
-	string dem_name <- "mnt-gz40.asc";        // "mnt-gz25.asc" = fine mode (~2.6x more cells)
+	string dem_name <- "mnt-gz50.asc";        // "mnt-gz25.asc" = fine mode (~2.6x more cells)
 	string sim_start <- "1926-07-20 00:00:00";// = record start: cycle k <-> CSV row k, toolbar time = days since 20 Jul
 	float  sub_dt_s <- 60.0;                  // hydraulic sub-step (s) inside each 1-hour cycle; 30 for final runs, 120-300 for previews
 	float  cap_frac <- 0.5;                   // fraction of a head difference equalised per sub-step (0.5 = pair-stable max)
+	bool   idle_sleep <- true;                // cells with 2 zero-flux sub-steps sleep until pushed or next hour (A/B-testable)
 
 	float  n_water <- 0.025;                  // Manning n: open water (river / lake cells)
 	float  n_field <- 0.05;                   // Manning n: floodplain / fields
@@ -66,7 +67,7 @@ global {
 	float  breach_invert_offset <- 0.0;       // m, added to per-breach computed invert
 	float  datum_offset <- 0.0;               // m, gauge datum minus DEM datum
 
-	float  lake_initial_depth <- 0.5;         // m of water seeded in lake cells
+	float  lake_initial_depth <- 0.5;         // each lake filled to (its lowest cell + this level), not a flat slab
 	float  lake_settle_hours <- 12.0;         // init-time settling of the seeded lakes (slab -> still ponds)
 	float  wet_thr <- 0.1;                    // m, building WET threshold
 	float  flood_thr <- 1.0;                  // m, building FLOODED threshold
@@ -100,6 +101,8 @@ global {
 	// ------------------------------------------------------------------ engine state
 	float cell_s <- 50.0;                     // cell size (m), measured at init
 	float cell_a <- 2500.0;                   // cell area (m2), measured at init
+	float inv_cell_a <- 1.0 / 2500.0;         // 1/cell_a (multiply instead of divide in hot loops)
+	float cap_vol <- 1250.0;                  // cell_a * cap_frac, refreshed hourly
 	float EPS_WET <- 1e-4;                    // m, minimum depth considered wet
 	float EPS_HEAD <- 1e-3;                   // m, minimum head difference that drives flow
 	list<cell> active_cells <- [];            // wet cells (and cells that ever got water) - metrics
@@ -131,11 +134,12 @@ global {
 			z <- grid_value;
 			neigh <- neighbors;
 			nb_n <- length(neigh);
-			out_v <- list_with(nb_n, 0.0);
 		}
 		cell one <- first(cell);
 		cell_a <- one.shape.area;
 		cell_s <- sqrt(cell_a);
+		inv_cell_a <- 1.0 / cell_a;
+		cap_vol <- cell_a * cap_frac;
 		float z_mean <- cell mean_of each.z;
 		if (z_mean > 9.0) {
 			write "WARNING: mean ground = " + (z_mean with_precision 2) + " m -> this is the MODERN DEM vintage "
@@ -167,13 +171,29 @@ global {
 		}
 		ask cell { blocked <- is_river or is_dyke or is_sealed; }
 
-		ask lake { ask cell overlapping self { is_lake <- true; } }
+		ask lake {
+			my_cells <- cell overlapping self;
+			ask my_cells { is_lake <- true; }
+		}
 		ask building {
 			my_cell <- first(cell overlapping location);
 			ask cell overlapping self { is_urban <- true; }
 		}
 		ask cell {
 			n_man <- (is_river or is_lake) ? n_water : (is_urban ? n_urban : n_field);
+		}
+		// hot-loop precomputation: open-neighbour lists (blocked never changes after this point)
+		// and per-face conductance constants K = w / (n_face * sqrt(dx)), so the sub-step flux
+		// is just heff^(5/3) * sqrt(dW) * K
+		float sq_dx <- sqrt(cell_s);
+		ask cell {
+			neigh_open <- neigh where (!each.blocked);
+			nb_open <- length(neigh_open);
+			out_v <- list_with(nb_open, 0.0);
+			K_face <- [];
+			loop nb over: neigh_open {
+				K_face << cell_s / (0.5 * (n_man + nb.n_man) * sq_dx);
+			}
 		}
 
 		// ---- dykes: parse break dates, compute per-breach invert from nearby floodplain ground
@@ -204,22 +224,39 @@ global {
 			}
 		}
 
-		// ---- initial water: lakes
-		ask cell where (each.is_lake and !each.blocked) {
-			water_h <- lake_initial_depth;
-			in_active <- true;
+		// ---- initial water: fill each lake to a LEVEL (its lowest cell + lake_initial_depth),
+		// not with a flat slab - a uniform depth on rim/canal/terrace cells drains across the
+		// whole domain during settling and freezes as a thin checkered film
+		ask lake {
+			list<cell> wet <- my_cells where (!each.blocked);
+			if (!empty(wet)) {
+				// fill to the SPILL level at most: never above the lowest ground touching the
+				// lake, so perched lakes/canals cannot drain across the floodplain at settling
+				float lvl <- (wet min_of each.z) + lake_initial_depth;
+				list<cell> ring <- remove_duplicates(wet accumulate each.neigh_open) - wet;
+				if (!empty(ring)) { lvl <- min(lvl, ring min_of each.z); }
+				ask wet where (each.z < lvl) {
+					water_h <- max(water_h, lvl - z);
+					in_active <- true;
+				}
+			}
 		}
 		active_cells <- cell where each.in_active;
-		lake_init_V <- (active_cells sum_of each.water_h) * cell_a;
-		// the flat slab seeded above is not an equilibrium: let it settle into the lake
-		// depressions NOW so the run starts from still ponds and the metric baseline is clean
+		// let the seeded ponds settle NOW so the run starts from still water
 		int settle_iters <- int(lake_settle_hours * 3600.0 / 120.0);
 		flow_list <- list(active_cells);
 		ask flow_list { in_flow <- true; }
 		loop times: settle_iters { do flow_step dts: 120.0; }
+		// sweep up the film that still escaped during settling: a few cm percolating through
+		// the DEM's cm-scale roughness (|z - mean(4nb)| is 2-16 cm here) freezes in every
+		// micro-low as a stable speckled sheet - a seeding artifact, not flood water
+		ask active_cells where (!each.is_lake and each.water_h < 0.05) { water_h <- 0.0; }
+		ask active_cells where (each.water_h <= EPS_WET) { in_active <- false; }
+		active_cells <- active_cells where each.in_active;
+		lake_init_V <- (active_cells sum_of each.water_h) * cell_a;   // ledger baseline AFTER the sweep
 		// settled state = metric baseline; clear `stirred` so the ponds start ASLEEP and the
 		// engine has zero work until the first weir push wakes cells up
-		ask cell { water0 <- water_h; stirred <- false; }
+		ask cell { water0 <- water_h; stirred <- false; idle_hr <- false; idle_subs <- 0; }
 
 		// ---- forcing series
 		matrix ms <- matrix(csv_file("../includes/RedRiverStage1926_hourly.csv", ",", true));
@@ -288,63 +325,73 @@ global {
 	// difference and scaled so a donor never sends more than it stores.
 	// (an action rather than a reflex so init can also run it to settle the seeded lakes)
 	action flow_step (float dts) {
-		ask flow_list parallel: true {
+		// flow_list never contains blocked cells (rebuild ring, B pushes and weir wakes all
+		// filter on neigh_open / rx_cells), so no blocked test is needed in the hot loop
+		ask (flow_list where (!each.idle_hr)) parallel: true {
 			has_out <- false;
-			if (water_h > EPS_WET and !blocked) {
+			float totV <- 0.0;
+			float max_dW <- 0.0;
+			// nb_open = 0 -> cell is walled in by blocked cells and can never flow; the guard also
+			// matters because GAML's `loop from: 0 to: -1` runs DOWNWARD (executes at i = 0)
+			if (nb_open > 0 and water_h > EPS_WET) {
 				float wsA <- z + water_h;
-				float totV <- 0.0;
-				loop i from: 0 to: nb_n - 1 {
+				loop i from: 0 to: nb_open - 1 {
 					out_v[i] <- 0.0;
-					cell nb <- neigh[i];
-					if (!nb.blocked) {
-						float dW <- wsA - (nb.z + nb.water_h);
-						if (dW > EPS_HEAD) {
-							float heff <- wsA - max(z, nb.z);
-							if (heff > EPS_WET) {
-								float q <- (heff ^ 1.6667) * sqrt(dW / cell_s) / (0.5 * (n_man + nb.n_man)) * cell_s;
-								float v <- min(q * dts, dW * cell_a * cap_frac);
-								if (v > 0.0) { out_v[i] <- v; totV <- totV + v; }
-							}
+					cell nb <- neigh_open[i];
+					float dW <- wsA - (nb.z + nb.water_h);
+					if (dW > EPS_HEAD) {
+						if (dW > max_dW) { max_dW <- dW; }
+						float heff <- wsA - max(z, nb.z);
+						if (heff > EPS_WET) {
+							float v <- min((heff ^ 1.6667) * sqrt(dW) * K_face[i] * dts, dW * cap_vol);
+							if (v > 0.0) { out_v[i] <- v; totV <- totV + v; }
 						}
 					}
 				}
-				if (totV > 0.0) {
-					float availV <- water_h * cell_a;
-					if (totV > availV) {
-						float sc <- availV / totV;
-						loop i from: 0 to: nb_n - 1 { out_v[i] <- out_v[i] * sc; }
-					}
-					has_out <- true;
+			}
+			if (totV > 0.0) {
+				// donor caps: its storage, AND it may not drop below its lowest neighbour's
+				// level (prevents multi-face over-send -> ping-pong -> checkerboard films)
+				float availV <- min(water_h * cell_a, max_dW * cap_vol);
+				if (totV > availV) {
+					float sc <- availV / totV;
+					loop i from: 0 to: nb_open - 1 { out_v[i] <- out_v[i] * sc; }
 				}
+				has_out <- true;
+				idle_subs <- 0;
+			} else if (idle_sleep) {
+				// two consecutive zero-flux sub-steps -> sleep until pushed or next hourly rebuild
+				idle_subs <- idle_subs + 1;
+				if (idle_subs >= 2) { idle_hr <- true; }
 			}
 		}
 
-		// Phase B (sequential push): donors deliver their volumes and wake up dry receivers.
-		ask flow_list {
-			if (has_out) {
-				float tot <- 0.0;
-				loop i from: 0 to: nb_n - 1 {
-					float v <- out_v[i];
-					if (v > 0.0) {
-						cell nb <- neigh[i];
-						nb.water_h <- nb.water_h + v / cell_a;
-						tot <- tot + v;
-						nb.stirred <- true;
-						if (!nb.in_active) { nb.in_active <- true; pending_cells << nb; }
-						if (!nb.in_flow) { nb.in_flow <- true; pending_flow << nb; }
-					}
+		// Phase B (sequential push, donors only): deliver volumes and wake the receivers.
+		ask (flow_list where each.has_out) {
+			float tot <- 0.0;
+			loop i from: 0 to: nb_open - 1 {
+				float v <- out_v[i];
+				if (v > 0.0) {
+					cell nb <- neigh_open[i];
+					nb.water_h <- nb.water_h + v * inv_cell_a;
+					tot <- tot + v;
+					nb.stirred <- true;
+					nb.idle_hr <- false;
+					nb.idle_subs <- 0;
+					if (!nb.in_active) { nb.in_active <- true; pending_cells << nb; }
+					if (!nb.in_flow) { nb.in_flow <- true; pending_flow << nb; }
 				}
-				water_h <- max(0.0, water_h - tot / cell_a);
-				moved_V_sub <- moved_V_sub + tot;
-				stirred <- true;
 			}
+			water_h <- max(0.0, water_h - tot * inv_cell_a);
+			moved_V_sub <- moved_V_sub + tot;
+			stirred <- true;
 		}
 		if (!empty(pending_cells)) {
-			active_cells <- active_cells + pending_cells;
+			active_cells <<+ pending_cells;
 			pending_cells <- [];
 		}
 		if (!empty(pending_flow)) {
-			flow_list <- flow_list + pending_flow;
+			flow_list <<+ pending_flow;
 			pending_flow <- [];
 		}
 	}
@@ -358,9 +405,12 @@ global {
 		ask active_cells { stirred <- false; }
 		flow_list <- [];
 		loop c over: seeds {
-			if (!c.in_flow) { c.in_flow <- true; flow_list << c; }
-			loop nb over: c.neigh { if (!nb.in_flow and !nb.blocked) { nb.in_flow <- true; flow_list << nb; } }
+			if (!c.in_flow) { c.in_flow <- true; c.idle_hr <- false; c.idle_subs <- 0; flow_list << c; }
+			loop nb over: c.neigh_open {
+				if (!nb.in_flow) { nb.in_flow <- true; nb.idle_hr <- false; nb.idle_subs <- 0; flow_list << nb; }
+			}
 		}
+		cap_vol <- cell_a * cap_frac;                 // keeps a mid-run cap_frac change effective
 		int n_sub <- max(1, int(step / sub_dt_s));
 		float dts <- step / n_sub;
 		loop i from: 1 to: n_sub {
@@ -390,8 +440,10 @@ global {
 						// one step: the source is a Dirichlet boundary, so this cannot oscillate
 						float v <- min(weir_coef * bw * (hu ^ 1.5) * f * dts, 0.9 * (se - wl) * cell_a);
 						if (v > 0.0) {
-							rc.water_h <- rc.water_h + v / cell_a;
+							rc.water_h <- rc.water_h + v * inv_cell_a;
 							rc.stirred <- true;
+							rc.idle_hr <- false;
+							rc.idle_subs <- 0;
 							if (!rc.in_active) { rc.in_active <- true; active_cells << rc; }
 							if (!rc.in_flow) { rc.in_flow <- true; flow_list << rc; }
 							river_in_V <- river_in_V + v;
@@ -409,8 +461,10 @@ global {
 							float v <- min(min(weir_coef * bw * (hu ^ 1.5) * f * dts, sc_.water_h * cell_a),
 								0.9 * (wl2 - se) * cell_a);
 							if (v > 0.0) {
-								sc_.water_h <- sc_.water_h - v / cell_a;
+								sc_.water_h <- sc_.water_h - v * inv_cell_a;
 								sc_.stirred <- true;
+								sc_.idle_hr <- false;
+								sc_.idle_subs <- 0;
 								if (!sc_.in_flow) { sc_.in_flow <- true; flow_list << sc_; }
 								river_out_V <- river_out_V + v;
 								moved_V_sub <- moved_V_sub + v;
@@ -527,6 +581,7 @@ species river schedules: [] {
 }
 
 species lake schedules: [] {
+	list<cell> my_cells <- [];
 	aspect default { draw shape.contour color: rgb(80, 140, 200) width: 1; }
 }
 
@@ -555,6 +610,11 @@ grid cell file: grid_file("../includes/" + dem_name) neighbors: 4
 	float water0 <- 0.0;                   // depth right after init (lakes): flood metrics are relative to it
 	bool stirred <- false;                 // moved/received water this hour -> stays scheduled next hour
 	bool in_flow <- false;                 // currently in flow_list
+	bool idle_hr <- false;                 // asleep for the rest of this hour (zero-flux cell)
+	int idle_subs <- 0;                    // consecutive zero-flux sub-steps
+	list<cell> neigh_open <- [];           // neighbours that are not blocked (precomputed at init)
+	int nb_open <- 0;
+	list<float> K_face <- [];              // per-open-face conductance w/(n_face*sqrt(dx))
 	list<cell> rx_cells <- [];             // weir receivers, filled when this crest cell breaches
 	float n_man <- 0.05;
 	int nb_n <- 0;
@@ -569,6 +629,7 @@ experiment flood_1926 type: gui {
 	parameter "Simulation start" var: sim_start among: ["1926-07-20 00:00:00", "1926-07-26 00:00:00"] category: "Time";
 	parameter "Hydraulic sub-step (s)" var: sub_dt_s min: 15.0 max: 600.0 category: "Time";
 	parameter "Transfer cap per sub-step" var: cap_frac min: 0.1 max: 0.5 category: "Time";
+	parameter "Idle-cell sleep (within hour)" var: idle_sleep category: "Time";
 	parameter "n open water" var: n_water category: "Hydraulics";
 	parameter "n floodplain" var: n_field category: "Hydraulics";
 	parameter "n urban" var: n_urban category: "Hydraulics";
