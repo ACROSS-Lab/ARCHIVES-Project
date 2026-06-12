@@ -52,7 +52,7 @@ global {
 	// 1926 gauge). mnt-gz50.asc and mnt-gz10.asc were overwritten with a modern DEM (z -2.6..43 m,
 	// stale .aux.xml statistics) whose datum is inconsistent with the stage record - do not use them.
 	string dem_name <- "mnt-gz40.asc";        // "mnt-gz25.asc" = fine mode (~2.6x more cells)
-	string sim_start <- "1926-07-26 00:00:00";// skip quiet pre-breach days (stage record starts 07-20)
+	string sim_start <- "1926-07-20 00:00:00";// = record start: cycle k <-> CSV row k, toolbar time = days since 20 Jul
 	float  sub_dt_s <- 60.0;                  // hydraulic sub-step (s) inside each 1-hour cycle; 30 for final runs, 120-300 for previews
 	float  cap_frac <- 0.5;                   // fraction of a head difference equalised per sub-step (0.5 = pair-stable max)
 
