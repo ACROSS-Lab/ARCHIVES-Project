@@ -118,7 +118,7 @@ global {
 	// ------------------------------------------------------------------
 	// Input data
 	// ------------------------------------------------------------------
-	file dem_file       <- grid_file("../includes/mnt-gz50.asc");
+	file dem_file       <- grid_file("../includes/mnt-gz10.asc");
 	file river_file     <- shape_file("../includes/RedRiver1925.shp");
 	file buildings_file <- shape_file("../includes/Buildings1925.shp");
 	file lakes_file     <- shape_file("../includes/Lakes1925.shp");
