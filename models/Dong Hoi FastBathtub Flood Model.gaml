@@ -1,0 +1,441 @@
+/**
+* Name: Dong Hoi FastBathtub Flood Model
+* Author: Thành Đô Nguyễn (2026-06-16)
+*
+* A dyke-free fork of "Hanoi FastBathtub Flood Model 1926.gaml" for the
+* Nhật Lệ / Đồng Hới coastal floodplain (Oct-2020 event).
+*
+* WHAT CHANGED vs the Hanoi model, and WHY.
+*   The Hanoi model is BREACH-driven: dykes are hard barriers and water reaches
+*   the plain ONLY through a breach corridor cut into a dyke. Đồng Hới has no
+*   dyke ring - it floods by the river/estuary spilling over its banks - so that
+*   model would flood nothing here. This fork keeps the same fast engine (a
+*   spread-limited, connectivity-constrained, hysteretic level-pool solved by one
+*   fast-sweeping pass) but SEEDS it from the RIVER BANK instead of breach
+*   corridors:
+*     S[c] = SPILL LEVEL: the lowest river stage at which c first connects to the
+*            river - the minimax (least-highest-sill) path level from the
+*            river-bank cells across passable land.
+*     T[c] = FRONT ARRIVAL: sim-seconds when the spreading front (celerity
+*            front_celerity, starting at the river bank at t=0) first reaches c.
+*   Each hour, at river stage L, a cell is wet iff BOTH the front has arrived
+*   (T[c] <= elapsed) AND it is river-connected at the stage (S[c] <= L):
+*       h = L - z   (tracks the stage up AND down; drains back toward the river).
+*   A cell that later fails S <= L on the receding limb keeps its water -> a
+*   trapped pond. The fields are static, so they are computed ONCE in init.
+*
+* INPUTS (../includes/ and ../includes/dong-hoi/).
+*   DEM: dong-hoi_3857.asc - the SRTM Nhật Lệ DEM REPROJECTED from EPSG:4326
+*        (degrees) to EPSG:3857 (metres) so it shares the CRS of the shapefiles
+*        and the engine's metric units (cell size, areas, celerity) are real
+*        metres. The original dong-hoi.asc is in geographic degrees and must NOT
+*        be used directly (cell width would be ~0.0003, not ~30 m).
+*   River: water_donghoi.shp (the Nhật Lệ estuary polygon) - the stage boundary.
+*   Buildings: building_multipolygon.shp (clipped to the domain in init).
+*   Forcing: DongHoiStage2020_hourly.csv (measured Đồng Hới water level, hourly,
+*        7-8 Oct 2020). NOTE the gauge-vs-DEM datum is UNKNOWN: calibrate
+*        datum_offset so the flood extent matches observations (see below).
+*/
+model DongHoiFastBathtubFlood
+
+global {
+
+	// ------------------------------------------------------------------ input
+	// DEM in EPSG:3857 metres (reprojected from the geographic dong-hoi.asc).
+	string dem_name     <- "dong-hoi_3857.asc";
+	file dem_file       <- grid_file("../includes/dong-hoi/" + dem_name);
+	file river_file     <- shape_file("../includes/dong-hoi/water_donghoi.shp");
+	file buildings_file <- shape_file("../includes/dong-hoi/building_multipolygon.shp");
+	file stage_file     <- csv_file("../includes/DongHoiStage2020_hourly.csv", ",", true);
+	geometry shape <- envelope(dem_file);
+
+	// ------------------------------------------------------------------ time
+	// the measured stage record is hourly, 7-8 Oct 2020 (48 h)
+	date starting_date <- date("2020-10-07 00:00:00");
+	date end_date      <- date("2020-10-08 23:00:00");
+	float step <- 1 #h;                       // ONE CYCLE = ONE HOUR
+
+	// ------------------------------------------------------------------ river stage forcing
+	// driven DIRECTLY by the measured Đồng Hới water level (no rating curve - we
+	// have the gauge). stage_series holds one value per hour from starting_date.
+	list<float> stage_series <- [];
+	int   n_stage <- 0;
+	float base_stage <- 7.0;                  // m, fallback if the CSV is empty
+	float river_stage <- 7.0;
+
+	// datum_offset = (gauge zero) - (DEM/SRTM zero), in metres. The Đồng Hới
+	// gauge datum is NOT the SRTM datum, so the raw stage is NOT a DEM elevation.
+	// This is THE calibration knob: water surface used by the engine is
+	//   L = river_stage + datum_offset.
+	// Lower it until the simulated extent matches the observed Oct-2020 flood.
+	float datum_offset <- 0.0;
+
+	// ------------------------------------------------------------------ engine / thresholds
+	float flood_threshold <- 0.05;  // m, depth above baseline counted as flooded
+	float wet_thr   <- 0.1;         // m, building WET threshold
+	float flood_thr <- 1.0;         // m, building FLOODED threshold
+	int   max_spill_sweeps <- 200;  // fast-sweeping rounds for the spill + front fields
+	bool  auto_pause <- true;
+
+	// ------------------------------------------------------------------ spread front (datum-robust knob)
+	// The flood front advances from the river bank at a finite celerity, so at any
+	// moment only cells within geodesic travel-time of the bank are wet, even if
+	// the level field (S <= stage) would allow more. This makes the extent
+	// spread-limited and datum-robust (geodesic travel time is invariant to a
+	// uniform vertical DEM shift). front_limit = false recovers the pure level-pool.
+	bool  front_limit <- true;
+	float front_celerity <- 0.05;   // m/s, flood-front spreading speed (CALIBRATE)
+
+	// ------------------------------------------------------------------ bookkeeping
+	int grid_cols; int grid_rows;
+	float cell_dx <- 30.0;
+	float z_min <- 0.0; float z_max <- 1.0;
+	float SPILL_BIG <- 1e9;
+	list<cell> river_cells <- [];
+	list<cell> floodable   <- [];           // cells the river can reach at SOME stage (finite S)
+	list<cell> metric_cells<- [];
+	float flooded_area_km2 <- 0.0;
+	float flood_volume_mm3 <- 0.0;
+	float peak_flooded_km2 <- 0.0;
+	int   n_bldg_wet <- 0;
+	int   n_bldg_flooded <- 0;
+	float front_reach_m <- 0.0;
+	bool  sim_finished <- false;
+
+	init {
+		write "=== Dong Hoi FastBathtub Flood (river-seeded, dyke-free level-pool) ===";
+		grid_cols <- 1 + max(cell collect each.grid_x);
+		grid_rows <- 1 + max(cell collect each.grid_y);
+		cell_dx <- first(cell).shape.width;
+
+		// --- terrain + neighbour references + inline pit fill -----------------
+		ask cell {
+			z <- grid_value;
+			is_nodata <- z < -1000.0;           // -32767 sentinel (none in this DEM, but guard)
+			nE <- grid_x < grid_cols - 1 ? cell[grid_x + 1, grid_y] : nil;
+			nW <- grid_x > 0             ? cell[grid_x - 1, grid_y] : nil;
+			nS <- grid_y < grid_rows - 1 ? cell[grid_x, grid_y + 1] : nil;
+			nN <- grid_y > 0             ? cell[grid_x, grid_y - 1] : nil;
+		}
+		ask cell where (!each.is_nodata) {
+			float ze <- (nE = nil or nE.is_nodata) ? z : nE.z;
+			float zw <- (nW = nil or nW.is_nodata) ? z : nW.z;
+			float zn <- (nN = nil or nN.is_nodata) ? z : nN.z;
+			float zs <- (nS = nil or nS.is_nodata) ? z : nS.z;
+			float pit <- min(max(0.0, ze - z), min(max(0.0, zw - z), min(max(0.0, zn - z), max(0.0, zs - z))));
+			z_dyn <- z + pit;
+		}
+		list<cell> valid_cells <- cell where (!each.is_nodata);
+		z_min <- valid_cells min_of each.z;
+		z_max <- valid_cells max_of each.z;
+		float z_mean <- valid_cells mean_of each.z;
+		write "Grid: " + grid_cols + " x " + grid_rows + " cells of " + (cell_dx with_precision 2)
+			+ " m, z " + (z_min with_precision 1) + ".." + (z_max with_precision 1) + " m (mean " + (z_mean with_precision 2) + ")";
+
+		// --- vector layers ----------------------------------------------------
+		create river_poly from: river_file;
+		create building from: buildings_file;
+
+		// river/estuary cells = stage boundary (held at the stage every hour)
+		ask river_poly { ask cell overlapping self where (!each.is_nodata) { is_river <- true; } }
+		river_cells <- cell where each.is_river;
+
+		// buildings: bind to a cell, drop those outside the DEM domain
+		ask building { my_cell <- first(cell overlapping location); }
+		ask building where (each.my_cell = nil) { do die; }
+
+		// baseline (flood metrics measured ABOVE this; no lakes here so h0 = 0)
+		ask cell { h0 <- h; }
+
+		// --- measured stage record -------------------------------------------
+		matrix sm <- matrix(stage_file);
+		loop r over: rows_list(sm) {
+			string ds <- string(r[0]);
+			if length(ds) > 0 and ds != "datetime" {
+				stage_series <+ float(r[1]);
+			}
+		}
+		n_stage <- length(stage_series);
+		if n_stage = 0 {
+			write "DongHoiStage2020_hourly.csv empty -> holding base_stage " + base_stage + " m";
+		} else {
+			write "Stage record: " + n_stage + " h, " + (min(stage_series) with_precision 2)
+				+ ".." + (max(stage_series) with_precision 2) + " m (gauge datum)";
+		}
+
+		// --- spill + front fields (static: river bank is the seed) -----------
+		do compute_fields;
+
+		// --- colours ----------------------------------------------------------
+		ask cell where (!each.is_nodata) {
+			float shade <- (z - z_min) / max(0.001, z_max - z_min);
+			terrain_color <- is_river ? rgb(70, 130, 180)
+				: rgb(70 + int(150 * shade), 80 + int(130 * shade), 60 + int(110 * shade));
+			color <- terrain_color;
+		}
+
+		river_stage <- stage_at(starting_date);
+		ask river_cells { h <- max(0.0, river_stage + datum_offset - z_dyn); }
+		do refresh_colors;
+
+		write "river cells: " + length(river_cells) + " | floodable cells: " + length(floodable)
+			+ " | buildings in domain: " + length(building);
+		write "Init done. Simulation: " + starting_date + " -> " + end_date;
+	}
+
+	// ====================================================================== forcing
+	float stage_at (date d) {
+		if n_stage = 0 { return base_stage; }
+		int hr <- int((d - starting_date) / 3600.0);
+		if hr < 0        { return first(stage_series); }
+		if hr >= n_stage { return last(stage_series); }
+		return stage_series[hr];
+	}
+
+	reflex update_stage {
+		river_stage <- stage_at(current_date);
+	}
+
+	// ====================================================================== spill + front fields
+	// Two static fields, both solved by the same fast sweeping (4 directional
+	// orders). The river is the boundary: every passable LAND cell adjacent to a
+	// river cell is a seed (it connects to the river once the stage clears its own
+	// ground), with the front clock starting at t=0. River and no-data cells are
+	// barriers (the front travels through land, not through the channel).
+	//   S[c] (spill_lvl) = lowest stage at which c connects to the river.
+	//   T[c] (front_arrival) = sim-seconds when the front first reaches c.
+	action compute_fields {
+		float inv_cel <- 1.0 / max(1e-6, front_celerity);   // s per metre of front travel
+		ask cell {
+			passable <- !is_river and !is_nodata;
+			spill_lvl <- SPILL_BIG;
+			front_dist <- SPILL_BIG;
+			front_arrival <- SPILL_BIG;
+		}
+		// seed: land cells touching the river enter at their own ground level,
+		// connected from the first hour (front clock = 0 at the bank)
+		ask cell where each.is_river {
+			loop nb over: [nE, nW, nN, nS] {
+				if nb != nil and nb.passable {
+					if nb.z_dyn < nb.spill_lvl { nb.spill_lvl <- nb.z_dyn; }
+					nb.front_dist <- 0.0;
+					nb.front_arrival <- 0.0;
+				}
+			}
+		}
+
+		list<list<cell>> sweep_orders <- [
+			cell sort_by (float(each.grid_y * grid_cols + each.grid_x)),
+			cell sort_by (float(each.grid_y * grid_cols - each.grid_x)),
+			cell sort_by (float(-(each.grid_y * grid_cols) + each.grid_x)),
+			cell sort_by (float(-(each.grid_y * grid_cols) - each.grid_x))
+		];
+		bool changed <- true;
+		int rounds <- 0;
+		loop while: (changed and rounds < max_spill_sweeps) {
+			changed <- false;
+			rounds <- rounds + 1;
+			loop ord over: sweep_orders {
+				loop ce over: ord {
+					if ce.passable {
+						float bestS <- ce.spill_lvl;
+						float bestD <- ce.front_dist;
+						float bestA <- ce.front_arrival;
+						loop nb over: [ce.nE, ce.nW, ce.nN, ce.nS] {
+							if nb != nil and nb.passable {
+								float candS <- max(nb.spill_lvl, ce.z_dyn);
+								if candS < bestS { bestS <- candS; }
+								float candD <- nb.front_dist + cell_dx;
+								if candD < bestD { bestD <- candD; }
+								float candA <- nb.front_arrival + cell_dx * inv_cel;
+								if candA < bestA { bestA <- candA; }
+							}
+						}
+						if bestS < ce.spill_lvl - 1e-6   { ce.spill_lvl <- bestS;     changed <- true; }
+						if bestD < ce.front_dist - 1e-3  { ce.front_dist <- bestD;    changed <- true; }
+						if bestA < ce.front_arrival - 1.0 { ce.front_arrival <- bestA; changed <- true; }
+					}
+				}
+			}
+		}
+		floodable    <- cell where (each.passable and each.spill_lvl < 0.5 * SPILL_BIG);
+		metric_cells <- floodable;
+		write "spill + front fields built in " + rounds + " sweep rounds; "
+			+ length(floodable) + " cells reachable from the river (S "
+			+ ((empty(floodable) ? 0.0 : floodable min_of each.spill_lvl) with_precision 2) + ".."
+			+ ((empty(floodable) ? 0.0 : floodable max_of each.spill_lvl) with_precision 2) + " m, D up to "
+			+ ((empty(floodable) ? 0.0 : floodable max_of each.front_dist) with_precision 0) + " m).";
+	}
+
+	// ====================================================================== dynamic flood (the engine)
+	// Spread-limited, connectivity-constrained, hysteretic level-pool. One
+	// filtered parallel ask per hour, no iteration. A cell is wet when BOTH the
+	// front has arrived (T[c] <= elapsed) AND it is river-connected at the stage
+	// (S[c] <= L); then it tracks the stage up and down. Cells that fall out of
+	// S <= L on the receding limb keep their water -> trapped ponds.
+	reflex dynamic_flood {
+		float L <- river_stage + datum_offset;
+		ask river_cells { h <- max(0.0, L - z_dyn); }       // river held at the stage (boundary)
+		if !empty(floodable) {
+			float elapsed_s <- front_limit ? (current_date - starting_date) : SPILL_BIG;
+			front_reach_m <- front_limit ? front_celerity * (current_date - starting_date) : SPILL_BIG;
+			ask (floodable where (each.spill_lvl <= L and each.front_arrival <= elapsed_s)) parallel: true {
+				h <- L - z_dyn;                              // >= 0 since z_dyn <= S <= L
+				wsl <- z_dyn + h;
+			}
+		}
+	}
+
+	// ====================================================================== bookkeeping
+	reflex bookkeeping {
+		ask metric_cells parallel: true {
+			float exc <- h - h0;
+			if exc > flood_threshold {
+				if arrival_h < 0.0 { arrival_h <- (current_date - starting_date) / 3600.0; }
+				if h > h_peak { h_peak <- h; }
+			}
+		}
+		list<cell> wet <- metric_cells where ((each.h - each.h0) > flood_threshold and !each.is_river);
+		flooded_area_km2 <- length(wet) * cell_dx * cell_dx / 1e6;
+		flood_volume_mm3 <- (wet sum_of (each.h - each.h0)) * cell_dx * cell_dx / 1e6;
+		peak_flooded_km2 <- max(peak_flooded_km2, flooded_area_km2);
+
+		ask building {
+			depth_w <- my_cell = nil ? 0.0 : max(0.0, my_cell.h - my_cell.h0);
+			status <- depth_w > flood_thr ? 2 : (depth_w > wet_thr ? 1 : 0);
+		}
+		n_bldg_wet     <- building count (each.status = 1);
+		n_bldg_flooded <- building count (each.status = 2);
+
+		do refresh_colors;
+		if current_date.hour mod 3 = 0 {
+			write "" + current_date + " | stage " + (river_stage with_precision 2) + " m (L "
+				+ ((river_stage + datum_offset) with_precision 2) + ") | flooded "
+				+ (flooded_area_km2 with_precision 2) + " km2 | vol "
+				+ (flood_volume_mm3 with_precision 1) + " Mm3 | bldg flooded " + n_bldg_flooded;
+		}
+	}
+
+	action refresh_colors {
+		ask metric_cells + river_cells {
+			if h > 0.02 {
+				float f <- min(1.0, h / 4.0);
+				color <- rgb(int(150 * (1 - f)), int(190 * (1 - f) + 30), int(180 + 75 * f));
+				was_wet_color <- true;
+			} else if was_wet_color {
+				color <- terrain_color;
+				was_wet_color <- false;
+			}
+		}
+	}
+
+	reflex stop_simulation when: current_date >= end_date {
+		sim_finished <- true;
+		write "End of event. Flooded area: " + (flooded_area_km2 with_precision 2)
+			+ " km2 (peak " + (peak_flooded_km2 with_precision 2) + " km2).";
+		if auto_pause { do pause; }
+	}
+}
+
+// ==========================================================================
+//  Raster domain (minimal grid agents, no scheduler stepping)
+// ==========================================================================
+grid cell file: dem_file neighbors: 4
+	use_regular_agents: false use_individual_shapes: false use_neighbors_cache: false schedules: [] {
+	float z;                 // raw DEM elevation (m, EPSG:3857)
+	float z_dyn;             // pit-filled terrain used by the level-pool
+	float h <- 0.0;          // water depth (m)
+	float h0 <- 0.0;         // initial depth (0 here; metrics measured above this)
+	float wsl <- 0.0;        // water-surface level z_dyn + h
+	float spill_lvl <- 1e9;  // S[c]: lowest stage at which the cell connects to the river
+	float front_dist <- 1e9; // D[c]: geodesic distance (m) from the nearest river bank
+	float front_arrival <- 1e9; // T[c]: sim-seconds when the front first reaches the cell
+	bool  passable <- false;
+	bool  is_river  <- false;
+	bool  is_nodata <- false;
+	float h_peak <- 0.0;
+	float arrival_h <- -1.0;
+	cell nE; cell nW; cell nN; cell nS;
+	rgb terrain_color <- #gray;
+	bool was_wet_color <- false;
+}
+
+// ==========================================================================
+//  Vector species (no reflexes; behaviour is driven by the global asks)
+// ==========================================================================
+species river_poly schedules: [] { aspect default { draw shape color: rgb(70, 130, 180, 120) border: #steelblue; } }
+species building   schedules: [] {
+	cell my_cell;
+	float depth_w <- 0.0;
+	int status <- 0;          // 0 dry, 1 wet, 2 flooded
+	aspect default { draw shape color: status = 2 ? #red : (status = 1 ? #orange : rgb(90, 90, 90)); }
+}
+
+// ==========================================================================
+//  Experiments
+// ==========================================================================
+experiment donghoi_fastbathtub type: gui {
+	parameter "Gauge datum offset (m) - CALIBRATE" var: datum_offset min: -15.0 max: 5.0 category: "Forcing";
+	parameter "Base river stage (m, fallback)" var: base_stage category: "Forcing";
+	parameter "Flood threshold (m)" var: flood_threshold min: 0.01 max: 0.5 category: "Engine";
+	parameter "Limit spread by front (datum-robust)" var: front_limit category: "Spread front";
+	parameter "Front celerity (m/s) - CALIBRATE" var: front_celerity min: 0.005 max: 2.0 category: "Spread front";
+	parameter "Auto pause at end" var: auto_pause category: "Engine";
+
+	output {
+		layout #split;
+		display "Flood simulation" type: 2d background: #black {
+			grid cell;
+			graphics "static landscape" refresh: false {
+				loop rp over: river_poly { draw rp.shape color: rgb(70, 130, 180, 120) border: #steelblue; }
+			}
+			species building;
+			graphics "info" {
+				draw string(current_date) + "   stage: " + (river_stage with_precision 2)
+					+ " m   flooded: " + (flooded_area_km2 with_precision 1) + " km2"
+					at: {world.shape.width * 0.02, world.shape.height * 0.03}
+					color: #white font: font("SansSerif", 16, #bold);
+			}
+		}
+		display "Time series" type: 2d {
+			chart "Dong Hoi flood event" type: series x_label: "hours since 07-10 00:00" {
+				data "River stage (m)" value: river_stage color: #blue marker: false;
+				data "Flooded area (km2)" value: flooded_area_km2 color: #red marker: false;
+				data "Flood volume (10^6 m3)" value: flood_volume_mm3 color: #darkorange marker: false;
+			}
+		}
+		monitor "Date" value: current_date;
+		monitor "River stage (m)" value: river_stage with_precision 2;
+		monitor "Water surface L (m)" value: (river_stage + datum_offset) with_precision 2;
+		monitor "Reachable cells" value: length(floodable);
+		monitor "Front reach (m)" value: front_limit ? int(front_reach_m) : -1;
+		monitor "Flooded area (km2)" value: flooded_area_km2 with_precision 2;
+		monitor "Peak flooded (km2)" value: peak_flooded_km2 with_precision 2;
+		monitor "Flood volume (10^6 m3)" value: flood_volume_mm3 with_precision 2;
+		monitor "Buildings wet / flooded" value: "" + n_bldg_wet + " / " + n_bldg_flooded;
+	}
+}
+
+// Display-free production / calibration experiment (numbers only, fastest).
+experiment donghoi_fastbathtub_fast type: gui {
+	parameter "Gauge datum offset (m) - CALIBRATE" var: datum_offset min: -15.0 max: 5.0 category: "Forcing";
+	parameter "Limit spread by front (datum-robust)" var: front_limit category: "Spread front";
+	parameter "Front celerity (m/s) - CALIBRATE" var: front_celerity min: 0.005 max: 2.0 category: "Spread front";
+
+	output {
+		display "Time series" type: 2d {
+			chart "Dong Hoi flood event" type: series x_label: "hours since 07-10 00:00" {
+				data "River stage (m)" value: river_stage color: #blue marker: false;
+				data "Flooded area (km2)" value: flooded_area_km2 color: #red marker: false;
+				data "Flood volume (10^6 m3)" value: flood_volume_mm3 color: #darkorange marker: false;
+			}
+		}
+		monitor "Date" value: current_date;
+		monitor "River stage (m)" value: river_stage with_precision 2;
+		monitor "Water surface L (m)" value: (river_stage + datum_offset) with_precision 2;
+		monitor "Front reach (m)" value: front_limit ? int(front_reach_m) : -1;
+		monitor "Flooded area (km2)" value: flooded_area_km2 with_precision 2;
+		monitor "Peak flooded (km2)" value: peak_flooded_km2 with_precision 2;
+		monitor "Flood volume (10^6 m3)" value: flood_volume_mm3 with_precision 2;
+	}
+}
