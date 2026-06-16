@@ -32,9 +32,11 @@
 *        be used directly (cell width would be ~0.0003, not ~30 m).
 *   River: water_donghoi.shp (the Nhật Lệ estuary polygon) - the stage boundary.
 *   Buildings: building_multipolygon.shp (clipped to the domain in init).
-*   Forcing: DongHoiStage2020_hourly.csv (measured Đồng Hới water level, hourly,
-*        7-8 Oct 2020). NOTE the gauge-vs-DEM datum is UNKNOWN: calibrate
-*        datum_offset so the flood extent matches observations (see below).
+*   Forcing: SAME STYLE AS THE HANOI MODEL - observed discharge
+*        (WaterDischarge_HamNinh.csv) -> Manning rating curve -> river stage.
+*        use_discharge_csv = false falls back to the measured Đồng Hới gauge
+*        (DongHoiStage2020_hourly.csv). NOTE the gauge-vs-DEM datum is UNKNOWN:
+*        calibrate datum_offset so the flood extent matches observations.
 */
 model DongHoiFastBathtubFlood
 
@@ -47,6 +49,7 @@ global {
 	file river_file     <- shape_file("../includes/dong-hoi/water_donghoi.shp");
 	file buildings_file <- shape_file("../includes/dong-hoi/building_multipolygon.shp");
 	file stage_file     <- csv_file("../includes/DongHoiStage2020_hourly.csv", ",", true);
+	file discharge_file <- csv_file("../includes/WaterDischarge_HamNinh.csv", ",", true);
 	geometry shape <- envelope(dem_file);
 
 	// ------------------------------------------------------------------ time
@@ -56,12 +59,21 @@ global {
 	float step <- 1 #h;                       // ONE CYCLE = ONE HOUR
 
 	// ------------------------------------------------------------------ river stage forcing
-	// driven DIRECTLY by the measured Đồng Hới water level (no rating curve - we
-	// have the gauge). stage_series holds one value per hour from starting_date.
+	// SAME STYLE AS THE HANOI MODEL: observed discharge (WaterDischarge_HamNinh.csv)
+	// -> Manning rating curve -> river stage. use_discharge_csv = false falls back
+	// to the measured Đồng Hới gauge (DongHoiStage2020_hourly.csv) instead.
+	bool  use_discharge_csv <- true;
+	float rating_exponent <- 0.6;             // Manning h ~ Q^(3/5)
+	float base_stage <- 7.0;                  // m, stage at the lowest recorded discharge
+	float peak_stage <- 12.2;                 // m, stage at the peak discharge (≈ observed WL_DongHoi peak)
+	float river_stage <- 7.0;
+	float river_discharge <- 0.0;
+	list<date>  q_dates  <- [];
+	list<float> q_values <- [];
+	float q_min <- 1.0; float q_max <- 2.0;
+	// measured-gauge fallback series (used when use_discharge_csv = false)
 	list<float> stage_series <- [];
 	int   n_stage <- 0;
-	float base_stage <- 7.0;                  // m, fallback if the CSV is empty
-	float river_stage <- 7.0;
 
 	// datum_offset = (gauge zero) - (DEM/SRTM zero), in metres. The Đồng Hới
 	// gauge datum is NOT the SRTM datum, so the raw stage is NOT a DEM elevation.
@@ -157,10 +169,34 @@ global {
 		}
 		n_stage <- length(stage_series);
 		if n_stage = 0 {
-			write "DongHoiStage2020_hourly.csv empty -> holding base_stage " + base_stage + " m";
+			write "DongHoiStage2020_hourly.csv empty -> gauge fallback unavailable";
 		} else {
-			write "Stage record: " + n_stage + " h, " + (min(stage_series) with_precision 2)
+			write "Stage record (fallback): " + n_stage + " h, " + (min(stage_series) with_precision 2)
 				+ ".." + (max(stage_series) with_precision 2) + " m (gauge datum)";
+		}
+
+		// --- observed discharge record (Hanoi-style: dates are M/D/YYYY H:MM) -
+		matrix qm <- matrix(discharge_file);
+		loop r over: rows_list(qm) {
+			string ds <- string(r[0]);
+			float qv <- float(r[1]);
+			if length(ds) > 0 and qv > 0.0 {
+				list<string> parts <- ds split_with " ";
+				list<string> dmy <- first(parts) split_with "/";
+				int hh <- 0;
+				if length(parts) > 1 { hh <- int(first(parts[1] split_with ":")); }
+				q_dates  <+ date([int(dmy[2]), int(dmy[0]), int(dmy[1]), hh, 0, 0]);
+				q_values <+ qv;
+			}
+		}
+		if empty(q_values) {
+			use_discharge_csv <- false;
+			write "WaterDischarge_HamNinh.csv empty -> using measured stage gauge";
+		} else {
+			q_min <- min(q_values); q_max <- max(q_values);
+			write "Discharge: " + length(q_values) + " values, " + first(q_dates) + ".." + last(q_dates)
+				+ ", " + (q_min with_precision 1) + "-" + (q_max with_precision 1) + " m3/s"
+				+ (use_discharge_csv ? "  (DRIVING the stage via rating curve)" : "  (CSV loaded; gauge is driving)");
 		}
 
 		// --- spill + front fields (static: river bank is the seed) -----------
@@ -184,7 +220,22 @@ global {
 	}
 
 	// ====================================================================== forcing
-	float stage_at (date d) {
+	// observed discharge interpolated in time (Hanoi-style)
+	float discharge_at (date d) {
+		if empty(q_values) { return 0.0; }
+		if d <= first(q_dates) { return first(q_values); }
+		if d >= last(q_dates)  { return last(q_values); }
+		loop i from: 1 to: length(q_dates) - 1 {
+			if d <= q_dates[i] {
+				float f <- (d - q_dates[i - 1]) / max(1.0, q_dates[i] - q_dates[i - 1]);
+				return q_values[i - 1] + f * (q_values[i] - q_values[i - 1]);
+			}
+		}
+		return last(q_values);
+	}
+
+	// measured-gauge stage (fallback when use_discharge_csv = false)
+	float measured_stage_at (date d) {
 		if n_stage = 0 { return base_stage; }
 		int hr <- int((d - starting_date) / 3600.0);
 		if hr < 0        { return first(stage_series); }
@@ -192,7 +243,19 @@ global {
 		return stage_series[hr];
 	}
 
+	// discharge -> Manning rating curve -> stage (Hanoi-style); else the gauge
+	float stage_at (date d) {
+		if use_discharge_csv and !empty(q_values) {
+			float q <- discharge_at(d);
+			float fq <- (q ^ rating_exponent - q_min ^ rating_exponent)
+			          / max(1e-6, q_max ^ rating_exponent - q_min ^ rating_exponent);
+			return base_stage + (peak_stage - base_stage) * min(1.0, max(0.0, fq));
+		}
+		return measured_stage_at(d);
+	}
+
 	reflex update_stage {
+		river_discharge <- discharge_at(current_date);
 		river_stage <- stage_at(current_date);
 	}
 
@@ -375,8 +438,11 @@ species building   schedules: [] {
 //  Experiments
 // ==========================================================================
 experiment donghoi_fastbathtub type: gui {
+	parameter "Use observed discharge (WaterDischarge_HamNinh.csv)" var: use_discharge_csv category: "Forcing";
+	parameter "Rating curve exponent" var: rating_exponent category: "Forcing";
+	parameter "Base river stage (m)" var: base_stage category: "Forcing";
+	parameter "Peak river stage (m)" var: peak_stage category: "Forcing";
 	parameter "Gauge datum offset (m) - CALIBRATE" var: datum_offset min: -15.0 max: 5.0 category: "Forcing";
-	parameter "Base river stage (m, fallback)" var: base_stage category: "Forcing";
 	parameter "Flood threshold (m)" var: flood_threshold min: 0.01 max: 0.5 category: "Engine";
 	parameter "Limit spread by front (datum-robust)" var: front_limit category: "Spread front";
 	parameter "Front celerity (m/s) - CALIBRATE" var: front_celerity min: 0.005 max: 2.0 category: "Spread front";
@@ -400,11 +466,13 @@ experiment donghoi_fastbathtub type: gui {
 		display "Time series" type: 2d {
 			chart "Dong Hoi flood event" type: series x_label: "hours since 07-10 00:00" {
 				data "River stage (m)" value: river_stage color: #blue marker: false;
+				data "Discharge (1000 m3/s)" value: river_discharge / 1000.0 color: #darkblue marker: false;
 				data "Flooded area (km2)" value: flooded_area_km2 color: #red marker: false;
 				data "Flood volume (10^6 m3)" value: flood_volume_mm3 color: #darkorange marker: false;
 			}
 		}
 		monitor "Date" value: current_date;
+		monitor "River discharge (m3/s)" value: river_discharge with_precision 1;
 		monitor "River stage (m)" value: river_stage with_precision 2;
 		monitor "Water surface L (m)" value: (river_stage + datum_offset) with_precision 2;
 		monitor "Reachable cells" value: length(floodable);
@@ -418,6 +486,9 @@ experiment donghoi_fastbathtub type: gui {
 
 // Display-free production / calibration experiment (numbers only, fastest).
 experiment donghoi_fastbathtub_fast type: gui {
+	parameter "Use observed discharge (WaterDischarge_HamNinh.csv)" var: use_discharge_csv category: "Forcing";
+	parameter "Rating curve exponent" var: rating_exponent category: "Forcing";
+	parameter "Peak river stage (m)" var: peak_stage category: "Forcing";
 	parameter "Gauge datum offset (m) - CALIBRATE" var: datum_offset min: -15.0 max: 5.0 category: "Forcing";
 	parameter "Limit spread by front (datum-robust)" var: front_limit category: "Spread front";
 	parameter "Front celerity (m/s) - CALIBRATE" var: front_celerity min: 0.005 max: 2.0 category: "Spread front";
@@ -426,11 +497,13 @@ experiment donghoi_fastbathtub_fast type: gui {
 		display "Time series" type: 2d {
 			chart "Dong Hoi flood event" type: series x_label: "hours since 07-10 00:00" {
 				data "River stage (m)" value: river_stage color: #blue marker: false;
+				data "Discharge (1000 m3/s)" value: river_discharge / 1000.0 color: #darkblue marker: false;
 				data "Flooded area (km2)" value: flooded_area_km2 color: #red marker: false;
 				data "Flood volume (10^6 m3)" value: flood_volume_mm3 color: #darkorange marker: false;
 			}
 		}
 		monitor "Date" value: current_date;
+		monitor "River discharge (m3/s)" value: river_discharge with_precision 1;
 		monitor "River stage (m)" value: river_stage with_precision 2;
 		monitor "Water surface L (m)" value: (river_stage + datum_offset) with_precision 2;
 		monitor "Front reach (m)" value: front_limit ? int(front_reach_m) : -1;
