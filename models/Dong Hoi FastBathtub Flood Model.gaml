@@ -80,7 +80,13 @@ global {
 	// This is THE calibration knob: water surface used by the engine is
 	//   L = river_stage + datum_offset.
 	// Lower it until the simulated extent matches the observed Oct-2020 flood.
-	float datum_offset <- 0.0;
+	// STARTING ANCHOR (SRTM dong-hoi_3857.asc, z -4..33 m, mean 6.1 m):
+	//   stage 7..12.2 m at offset 0 -> L 7..12.2 m -> floods 66..87% of cells (drowns the hills).
+	//   offset -6.0 -> L 1.0..6.2 m -> ~17% at base, ~61% at peak: a river ribbon that
+	//   grows over the low plain (z<=6 m) while sparing the dunes/hills (z>10 m).
+	// Move it in 1 m steps against the observed extent: each -1 m drops L (and the
+	// flooded fraction) by one row of the table in the file's calibration notes.
+	float datum_offset <- -5.185;
 
 	// ------------------------------------------------------------------ engine / thresholds
 	float flood_threshold <- 0.05;  // m, depth above baseline counted as flooded
