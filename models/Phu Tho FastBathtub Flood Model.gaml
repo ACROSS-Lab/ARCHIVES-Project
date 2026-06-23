@@ -64,7 +64,7 @@ global {
 	bool  use_discharge_csv <- true;
 	float rating_exponent <- 0.6;             // Manning h ~ Q^(3/5)
 	float base_stage <- 13.3;                 // m, stage at the lowest recorded discharge (gauge min)
-	float peak_stage <- 18.34;                // m, stage at the peak discharge (verified crest, Sep 11)
+	float peak_stage <- 25.00;                // m, stage at the peak discharge (verified crest, Sep 11)
 	float stage_cap  <- 30.0;                 // m, HARD CEILING on river stage (uncapped rating curve can overshoot)
 	float river_baseflow <- 1.5;              // m, minimum water depth kept in the channel (bed + baseflow),
 	                                          // so the river stays CONTINUOUSLY filled along its sloping bed
@@ -95,7 +95,7 @@ global {
 	//   connectivity trims the model below this). Target HEC-RAS ~128 km2 -> crest
 	//   L ~24-25 m. crest L = peak_stage(18.34) + datum_offset, so offset 6 -> L 24.3.
 	//   Sweep +5..+7 watching the "Flooded area" monitor to land on 128 km2.
-	float datum_offset <- 6.0;
+	float datum_offset <- 0.0;
 
 	// ------------------------------------------------------------------ engine / thresholds
 	float flood_threshold <- 0.05;  // m, depth above baseline counted as flooded

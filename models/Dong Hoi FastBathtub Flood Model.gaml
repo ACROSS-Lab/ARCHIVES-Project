@@ -64,8 +64,8 @@ global {
 	// to the measured Đồng Hới gauge (DongHoiStage2020_hourly.csv) instead.
 	bool  use_discharge_csv <- true;
 	float rating_exponent <- 0.6;             // Manning h ~ Q^(3/5)
-	float base_stage <- 7.0;                  // m, stage at the lowest recorded discharge
-	float peak_stage <- 12.2;                 // m, stage at the peak discharge (≈ observed WL_DongHoi peak)
+	float base_stage <- 1.0;                  // m, stage at the lowest recorded discharge
+	float peak_stage <- 7.0;                 // m, stage at the peak discharge (≈ observed WL_DongHoi peak)
 	float river_stage <- 7.0;
 	float river_discharge <- 0.0;
 	list<date>  q_dates  <- [];
@@ -86,7 +86,7 @@ global {
 	//   grows over the low plain (z<=6 m) while sparing the dunes/hills (z>10 m).
 	// Move it in 1 m steps against the observed extent: each -1 m drops L (and the
 	// flooded fraction) by one row of the table in the file's calibration notes.
-	float datum_offset <- -5.185;
+	float datum_offset <- 0;
 
 	// ------------------------------------------------------------------ engine / thresholds
 	float flood_threshold <- 0.05;  // m, depth above baseline counted as flooded
