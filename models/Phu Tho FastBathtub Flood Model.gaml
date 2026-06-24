@@ -46,6 +46,7 @@ global {
 	file dem_file       <- grid_file("../includes/phu-tho/" + dem_name);
 	file river_file     <- shape_file("../includes/phu-tho/water_phutho.shp");
 	file buildings_file <- shape_file("../includes/phu-tho/building_phutho.shp");
+	file points_file    <- shape_file("../includes/phu-tho/depth_arrival_time.shp");  // observation points (id), reprojected to EPSG:3857
 	file stage_file     <- csv_file("../includes/PhuThoStage2024_hourly.csv", ",", true);
 	file discharge_file <- csv_file("../includes/WaterDischarge_PhuTho_hourly.csv", ",", true);
 	geometry shape <- envelope(dem_file);
@@ -183,6 +184,10 @@ global {
 		// buildings: bind to a cell, drop those outside the DEM domain
 		ask building { my_cell <- first(cell overlapping location); }
 		ask building where (each.my_cell = nil) { do die; }
+
+		// observation points: bind each to its cell (arrival time recorded as the flood reaches it)
+		create observation_point from: points_file with: [pid::int(read("id"))];
+		ask observation_point { my_cell <- first(cell overlapping self); }
 
 		// baseline (flood metrics measured ABOVE this; no lakes here so h0 = 0)
 		ask cell { h0 <- h; }
@@ -410,6 +415,15 @@ global {
 		n_bldg_wet     <- building count (each.status = 1);
 		n_bldg_flooded <- building count (each.status = 2);
 
+		// record the flood ARRIVAL TIME at each observation point (first hour its cell goes wet)
+		ask observation_point where (each.arrival_h < 0.0) {
+			if my_cell != nil and (my_cell.h - my_cell.h0) > flood_threshold {
+				arrival_h <- (current_date - starting_date) / 3600.0;
+				write "Observation point " + pid + " reached on " + current_date
+					+ " (depth " + ((my_cell.h - my_cell.h0) with_precision 2) + " m)";
+			}
+		}
+
 		do refresh_colors;
 		if current_date.hour mod 6 = 0 {
 			write "" + current_date + " | stage " + (river_stage with_precision 2) + " m (L "
@@ -453,6 +467,9 @@ global {
 		sim_finished <- true;
 		write "End of event. Flooded area: " + (flooded_area_km2 with_precision 2)
 			+ " km2 (peak " + (peak_flooded_km2 with_precision 2) + " km2).";
+		ask observation_point {
+			write "Point " + pid + " arrival: " + (arrival_h < 0.0 ? "never" : string(arrival_h with_precision 1) + " h");
+		}
 		if auto_pause { do pause; }
 	}
 }
@@ -490,6 +507,16 @@ species building   schedules: [] {
 	int status <- 0;          // 0 dry, 1 wet, 2 flooded
 	aspect default { draw shape color: status = 2 ? #red : (status = 1 ? #orange : rgb(90, 90, 90)); }
 }
+species observation_point schedules: [] {
+	int pid;
+	cell my_cell;
+	float arrival_h <- -1.0;          // hours since start when the flood first reached this point (-1 = never)
+	aspect default {
+		draw circle(120) color: arrival_h < 0.0 ? #white : #red border: #black;
+		draw string(pid) + (arrival_h < 0.0 ? "" : (" : " + (arrival_h with_precision 1) + " h"))
+			at: location + {150, -100} color: #black font: font("SansSerif", 14, #bold);
+	}
+}
 
 // ==========================================================================
 //  Experiments
@@ -516,6 +543,7 @@ experiment phutho_fastbathtub type: gui {
 				loop rp over: river_poly { draw rp.shape color: rgb(70, 130, 180, 120) border: #steelblue; }
 			}
 			species building;
+			species observation_point;
 			graphics "info" {
 				draw string(current_date) + "   stage: " + (river_stage with_precision 2)
 					+ " m   flooded: " + (flooded_area_km2 with_precision 1) + " km2"
