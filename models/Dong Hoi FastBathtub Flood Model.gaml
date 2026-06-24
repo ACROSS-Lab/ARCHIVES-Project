@@ -43,8 +43,15 @@ model DongHoiFastBathtubFlood
 global {
 
 	// ------------------------------------------------------------------ input
-	// DEM in EPSG:3857 metres (reprojected from the geographic dong-hoi.asc).
-	string dem_name     <- "dong-hoi_3857.asc";
+	// DEM in UTM zone 48N (EPSG:32648) metres. The whole Dong Hoi dataset (this DEM and
+	// both shapefiles) was reprojected from EPSG:3857 to EPSG:32648, because Pseudo-Mercator
+	// (3857) is broken in this GAMA/GeoTools stack on TWO counts: (1) GAMA mis-reprojected
+	// the 3857 shapefiles onto the 3857 grid -> river cells: 0, buildings in domain: 1 ->
+	// nothing floods; (2) GeoTools' GeoTIFF writer cannot encode Pseudo-Mercator -> the
+	// per-step export crashed ("Unable to map projection Popular Visualisation Pseudo
+	// Mercator"). UTM 48N is a plain Transverse Mercator that GeoTools handles for read,
+	// overlap AND write, and gives true areas (3857 inflates area ~10% at 17 N).
+	string dem_name     <- "dong-hoi_utm48n.tif";
 	file dem_file       <- grid_file("../includes/dong-hoi/" + dem_name);
 	file river_file     <- shape_file("../includes/dong-hoi/water_donghoi.shp");
 	file buildings_file <- shape_file("../includes/dong-hoi/building_multipolygon.shp");
