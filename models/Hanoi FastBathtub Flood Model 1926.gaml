@@ -150,6 +150,14 @@ global {
 	float front_reach_m <- 0.0;             // current front radius R(t) (m), for the monitor
 	bool  sim_finished <- false;
 
+	// ------------------------------------------------------------------ geotiff export
+	// One georeferenced GeoTIFF per hour holding the water DEPTH (m) of every cell.
+	// The filename encodes the step (cycle), the sim time, the flooded area and the
+	// peak water height at that step, e.g.:
+	//   wh_step0012_19260720-1200_area3.45km2_peak2.31m.tif
+	bool   export_geotiff <- true;
+	string export_dir <- "../exported_results/hanoi_fastbathtub_1926/";
+
 	init {
 		write "=== Hanoi FastBathtub Flood 1926 (fast level-pool, ABM-equivalent extent) ===";
 		grid_cols <- 1 + max(cell collect each.grid_x);
@@ -259,6 +267,10 @@ global {
 		write "strict-dyke level-pool: dry until the first breach (" + first_break_time + ").";
 		write "Init done. Simulation: " + starting_date + " -> " + end_date;
 	}
+
+	// ====================================================================== filename helpers
+	string pad2 (int v) { return (v < 10 ? "0" : "") + v; }
+	string pad4 (int v) { string s <- "" + v; loop while: (length(s) < 4) { s <- "0" + s; } return s; }
 
 	// ====================================================================== forcing
 	float discharge_at (date d) {
@@ -441,6 +453,24 @@ global {
 		}
 	}
 
+	// ====================================================================== geotiff export (every step)
+	// Runs AFTER bookkeeping (so flooded_area_km2 is current) and writes the water
+	// DEPTH (m) of every cell to a georeferenced GeoTIFF. The filename carries the
+	// step, the sim time, the flooded area and the peak water height at this step.
+	reflex export_water_height when: export_geotiff {
+		// flooded footprint = same rule as flooded_area (excess above baseline, not river)
+		list<cell> wet_land <- metric_cells where ((each.h - each.h0) > flood_threshold and !each.is_river);
+		float peak_h <- empty(wet_land) ? 0.0 : wet_land max_of each.h;
+		// band value = actual water depth on flooded land, 0 on dry land
+		ask cell { grid_value <- (((h - h0) > flood_threshold) and !is_river) ? h : 0.0; }
+		string ts <- "" + current_date.year + pad2(current_date.month) + pad2(current_date.day)
+			+ "-" + pad2(current_date.hour) + pad2(current_date.minute);
+		string fname <- export_dir + "wh_step" + pad4(cycle) + "_" + ts
+			+ "_area" + (flooded_area_km2 with_precision 2) + "km2"
+			+ "_peak" + (peak_h with_precision 2) + "m.tif";
+		save cell to: fname format: "geotiff";
+	}
+
 	action refresh_colors {
 		ask metric_cells + river_cells {
 			if h > 0.02 {
@@ -566,6 +596,7 @@ experiment fastbathtub_1926 type: gui {
 	parameter "Flood threshold (m)" var: flood_threshold min: 0.01 max: 0.5 category: "Engine";
 	parameter "Limit spread by front (ABM-like / datum-robust)" var: front_limit category: "Spread front";
 	parameter "Front celerity (m/s) - CALIBRATE to ABM" var: front_celerity min: 0.005 max: 2.0 category: "Spread front";
+	parameter "Export water-height GeoTIFF each step" var: export_geotiff category: "Export";
 	parameter "Auto pause at end" var: auto_pause category: "Engine";
 
 	output {
@@ -613,6 +644,7 @@ experiment fastbathtub_1926_fast type: gui {
 	parameter "Breach cut half-width (m)" var: breach_cut_halfwidth category: "Breaching";
 	parameter "Limit spread by front (ABM-like / datum-robust)" var: front_limit category: "Spread front";
 	parameter "Front celerity (m/s) - CALIBRATE to ABM" var: front_celerity min: 0.005 max: 2.0 category: "Spread front";
+	parameter "Export water-height GeoTIFF each step" var: export_geotiff category: "Export";
 
 	output {
 		display "Time series" type: 2d {
