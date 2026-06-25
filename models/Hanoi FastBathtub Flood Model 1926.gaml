@@ -51,11 +51,11 @@
 *   mean 6.75 m), so the two models are directly comparable. mnt-gz50.asc is the
 *   modern DEM used by the V5 LISEM model (different vertical datum). Plus
 *   RedRiver1925.shp, Buildings1925.shp, Lakes1925.shp, 5_arrival_time.shp,
-*   Dykes.shp (BREAK/DATE/Commune), WaterDischarge.csv.
+*   Dyke_vip.shp (BREAK/DATE/Commune/HOUR), WaterDischarge.csv.
 *
 * Forcing & breach scenario are kept identical to the V5 LISEM model: observed
 *   daily discharge -> Manning rating curve -> stage (peak 11.93 m, Gourou
-*   fig. 9), and the Dykes.shp 28/29-07 breach dates cut as a corridor.
+*   fig. 9), and the Dyke_vip.shp 28/29-07 breach dates+HOUR cut as a corridor.
 */
 model HanoiFastBathtubFlood1926
 
@@ -71,7 +71,7 @@ global {
 	file buildings_file <- shape_file("../includes/Buildings1925.shp");
 	file lakes_file     <- shape_file("../includes/Lakes1925.shp");
 	file points_file    <- shape_file("../includes/5_arrival_time.shp");
-	file dykes_file     <- shape_file("../includes/Dykes.shp");
+	file dykes_file     <- shape_file("../includes/Dyke_vip.shp");   // BREAK/DATE/Commune + HOUR (exact breach hour)
 	file discharge_file <- csv_file("../includes/WaterDischarge.csv", ",", true);
 	geometry shape <- envelope(dem_file);
 
@@ -98,7 +98,7 @@ global {
 	// ------------------------------------------------------------------ breach scenario
 	// (identical geometry to the V5 LISEM model: invert from the lowest
 	//  protected-side ground, corridor cut through the embankment width)
-	int   breach_hour <- 6;
+	int   breach_hour <- 6;       // FALLBACK hour-of-day, used only when a breaching dyke's HOUR is "**"/missing
 	float breach_floor_min <- 2.0;       // m, breach invert never below this
 	float breach_freeboard <- 0.2;       // m, invert sits this above the land side
 	float breach_search_radius <- 300.0; // m, search radius for the invert ground level
@@ -193,7 +193,8 @@ global {
 		create dyke from: dykes_file with: [
 			break_s::string(read("BREAK")),
 			date_s::string(read("DATE")),
-			commune::string(read("Commune"))
+			commune::string(read("Commune")),
+			hour_s::string(read("HOUR"))
 		];
 		create observation_point from: points_file with: [pid::int(read("id"))];
 
@@ -204,7 +205,8 @@ global {
 			if will_break and length(date_s) >= 5 {
 				int dd <- int(copy_between(date_s, 0, 2));
 				int mm <- int(copy_between(date_s, 3, 5));
-				breach_date <- date([1926, mm, dd, breach_hour, 0, 0]);
+				int hh <- world.hour_from(hour_s, breach_hour);   // exact hour from the HOUR field; breach_hour if "**"/missing
+				breach_date <- date([1926, mm, dd, hh, 0, 0]);
 			} else {
 				will_break <- false;
 			}
@@ -276,6 +278,22 @@ global {
 	// ====================================================================== filename helpers
 	string pad2 (int v) { return (v < 10 ? "0" : "") + v; }
 	string pad4 (int v) { string s <- "" + v; loop while: (length(s) < 4) { s <- "0" + s; } return s; }
+
+	// parse the HOUR attribute into an hour-of-day 0..23; returns the fallback when
+	// the field is missing / "**" / nil / out of range (empty dBase numeric fields
+	// read back as "**", so the digits are validated before being trusted).
+	int hour_from (string s, int fallback) {
+		if s = nil or length(s) = 0 { return fallback; }
+		string digits <- first(s split_with ".");          // tolerate "16" or "16.0"
+		if digits = nil or length(digits) = 0 { return fallback; }
+		bool ok <- true;
+		loop i from: 0 to: length(digits) - 1 {
+			if !(copy_between(digits, i, i + 1) in ["0","1","2","3","4","5","6","7","8","9"]) { ok <- false; }
+		}
+		if !ok { return fallback; }
+		int h <- int(digits);
+		return (h >= 0 and h <= 23) ? h : fallback;
+	}
 
 	// ====================================================================== forcing
 	float discharge_at (date d) {
@@ -553,7 +571,7 @@ grid cell file: dem_file neighbors: 4
 //  Vector species (no reflexes; behaviour is driven by the global asks)
 // ==========================================================================
 species dyke schedules: [] {
-	string break_s; string date_s; string commune;
+	string break_s; string date_s; string commune; string hour_s;
 	bool will_break <- false;
 	bool opened <- false;
 	date breach_date;
@@ -617,7 +635,7 @@ experiment fastbathtub_1926 type: gui {
 	parameter "Base river stage (m)" var: base_stage category: "Forcing";
 	parameter "Peak river stage (m)" var: peak_stage category: "Forcing";
 	parameter "Gauge datum offset (m)" var: datum_offset min: -3.0 max: 3.0 category: "Forcing";
-	parameter "Breach hour of day" var: breach_hour category: "Breaching";
+	parameter "Breach hour fallback (when HOUR missing)" var: breach_hour category: "Breaching";
 	parameter "Breach invert search radius (m)" var: breach_search_radius category: "Breaching";
 	parameter "Breach cut half-width (m)" var: breach_cut_halfwidth category: "Breaching";
 	parameter "Initial lake depth (m)" var: lake_initial_depth min: 0.0 max: 2.0 category: "Initial state";
