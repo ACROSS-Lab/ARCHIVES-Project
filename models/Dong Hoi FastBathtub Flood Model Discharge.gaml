@@ -341,8 +341,9 @@ global {
 	reflex export_water_height when: export_geotiff {
 		list<cell> wet_land <- metric_cells where ((each.h - each.h0) > flood_threshold and !each.is_river);
 		float peak_h <- empty(wet_land) ? 0.0 : wet_land max_of each.h;
-		// band value = actual water depth on flooded land, 0 on dry land, -9999 on no-data
-		ask cell { grid_value <- is_nodata ? -9999.0 : ((((h - h0) > flood_threshold) and !is_river) ? h : 0.0); }
+		// band value = water depth: river channel depth on river cells, flood depth on
+		// flooded land, 0 on dry land, -9999 on no-data
+		ask cell { grid_value <- is_nodata ? -9999.0 : ((is_river or ((h - h0) > flood_threshold)) ? h : 0.0); }
 		string ts <- "" + current_date.year + pad2(current_date.month) + pad2(current_date.day)
 			+ "-" + pad2(current_date.hour) + pad2(current_date.minute);
 		string fname <- export_dir + "wh_step" + pad4(cycle) + "_" + ts
