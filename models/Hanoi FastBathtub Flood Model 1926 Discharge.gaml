@@ -311,9 +311,12 @@ global {
 		// the RIVER SIDE as the stage rises (front clock = 0 at the bank), BEFORE any
 		// breach. Non-breached dyke cells are barriers, so this fills only up to the
 		// dyke on the river side; the protected plain stays dry until a corridor opens.
+		// (skip corridor cells: those are the breach gate, seeded at breach_open_s
+		//  above - the river side must NOT stamp them with t=0, or that credit leaks
+		//  through the breach into the protected plain as a burst.)
 		ask cell where each.is_river {
 			loop nb over: [nE, nW, nN, nS] {
-				if nb != nil and nb.passable {
+				if nb != nil and nb.passable and !nb.is_corridor {
 					nb.spill_lvl <- min(nb.spill_lvl, nb.z_dyn);
 					nb.front_dist <- 0.0;
 					nb.front_arrival <- 0.0;
@@ -346,8 +349,13 @@ global {
 								// front distance: geodesic, one cell step (diagnostic)
 								float candD <- nb.front_dist + cell_dx;
 								if candD < bestD { bestD <- candD; }
-								// front arrival TIME: neighbour's arrival + travel time of one cell
+								// front arrival TIME: neighbour's arrival + travel time of one cell.
+								// A corridor cell is a TIME GATE: water cannot cross the breach
+								// before it opens, so floor any candidate at this cell's own
+								// breach_open_s. (Without this the river-side seed's t=0 credit
+								// would leak through the corridor the instant the breach opens -> burst.)
 								float candA <- nb.front_arrival + cell_dx * inv_cel;
+								if ce.is_corridor and candA < ce.breach_open_s { candA <- ce.breach_open_s; }
 								if candA < bestA { bestA <- candA; }
 							}
 						}
