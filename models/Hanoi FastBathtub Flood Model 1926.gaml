@@ -250,6 +250,11 @@ global {
 				+ ", " + q_min + "-" + q_max + " m3/s";
 		}
 
+		// --- spill + front fields: the river bank seeds the river side from t=0 (so
+		//     the river fills up to the dyke as the stage rises); a breach re-runs
+		//     compute_fields to add the protected side through the corridor ----------
+		do compute_fields;
+
 		// --- colours ----------------------------------------------------------
 		ask cell {
 			float shade <- (z - z_min) / max(0.001, z_max - z_min);
@@ -264,7 +269,7 @@ global {
 
 		write "river cells: " + length(river_cells) + " | dyke cells: " + (cell count each.is_dyke)
 			+ " | lake cells: " + length(lake_cells);
-		write "strict-dyke level-pool: dry until the first breach (" + first_break_time + ").";
+		write "river-side fills to the dyke from t=0; protected plain dry until the first breach (" + first_break_time + ").";
 		write "Init done. Simulation: " + starting_date + " -> " + end_date;
 	}
 
@@ -343,6 +348,20 @@ global {
 			front_arrival <- breach_open_s;
 		}
 
+		// river-bank entry: every passable LAND cell touching the river floods from
+		// the RIVER SIDE as the stage rises (front clock = 0 at the bank), BEFORE any
+		// breach. Non-breached dyke cells are barriers, so this fills only up to the
+		// dyke on the river side; the protected plain stays dry until a corridor opens.
+		ask cell where each.is_river {
+			loop nb over: [nE, nW, nN, nS] {
+				if nb != nil and nb.passable {
+					nb.spill_lvl <- min(nb.spill_lvl, nb.z_dyn);
+					nb.front_dist <- 0.0;
+					nb.front_arrival <- 0.0;
+				}
+			}
+		}
+
 		list<list<cell>> sweep_orders <- [
 			cell sort_by (float(each.grid_y * grid_cols + each.grid_x)),
 			cell sort_by (float(each.grid_y * grid_cols - each.grid_x)),
@@ -404,9 +423,9 @@ global {
 	reflex dynamic_flood {
 		float L <- river_stage + datum_offset;
 		ask river_cells { h <- max(0.0, L - z_dyn); }       // river held at the stage (source/boundary)
-		if !empty(floodable) and first_break_time != nil {
+		if !empty(floodable) {
 			float elapsed_s <- front_limit ? (current_date - starting_date) : SPILL_BIG;
-			front_reach_m <- front_limit ? front_celerity * (current_date - first_break_time) : SPILL_BIG;
+			front_reach_m <- front_limit ? front_celerity * (current_date - starting_date) : SPILL_BIG;
 			ask (floodable where (each.spill_lvl <= L and each.front_arrival <= elapsed_s)) parallel: true {
 				h <- L - z_dyn;                              // >= 0 since z_dyn <= S <= L
 				wsl <- z_dyn + h;
