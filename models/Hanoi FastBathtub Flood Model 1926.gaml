@@ -65,7 +65,7 @@ global {
 	// DEM: default mnt-gz40.asc = the ARCHIVAL 1926-datum MNT the ABM runs on (so the
 	// two are directly comparable). mnt-gz50.asc = modern DEM used by the V5 LISEM model
 	// (different vertical datum - only for the LISEM comparison, not the ABM one).
-	string dem_name     <- "mnt-gz10.asc";
+	string dem_name     <- "mnt-gz50.asc";
 	file dem_file       <- grid_file("../includes/" + dem_name);
 	file river_file     <- shape_file("../includes/RedRiver1925.shp");
 	file buildings_file <- shape_file("../includes/Buildings1925.shp");
@@ -85,7 +85,7 @@ global {
 	bool  use_discharge_csv <- true;
 	float rating_exponent <- 0.6;   // Manning h ~ Q^(3/5)
 	float base_stage <- 7.0;        // m, stage at the lowest recorded discharge (~22-07)
-	float peak_stage <- 11.93;      // m, observed 1926 peak at Hanoi (Gourou fig. 9)
+	float peak_stage <- 16.00;      // m, observed 1926 peak at Hanoi (Gourou fig. 9)
 	date  peak_date  <- date("1926-07-30 00:00:00");
 	float sigma_rise_days <- 3.5;   // gaussian rising limb (fallback)
 	float sigma_fall_days <- 3.0;   // gaussian falling limb (fallback)
@@ -127,7 +127,7 @@ global {
 	// toward the full bathtub; smaller -> tighter footprint. front_limit = false
 	// disables the front and recovers the pure (datum-sensitive) level-pool.
 	bool  front_limit <- true;
-	float front_celerity <- 0.02;   // m/s, flood-front spreading speed (CALIBRATE to the ABM; ~0.02 m/s
+	float front_celerity <- 0.05;   // m/s, flood-front spreading speed (CALIBRATE to the ABM; ~0.02 m/s
 	                                 // reaches ~1.7 km/day, so the front binds before the full bathtub)
 
 	// ------------------------------------------------------------------ bookkeeping
@@ -583,7 +583,7 @@ species observation_point schedules: [] {
 //  Experiments
 // ==========================================================================
 experiment fastbathtub_1926 type: gui {
-	parameter "DEM file" var: dem_name among: ["mnt-gz40.asc", "mnt-gz25.asc", "mnt-gz50.asc", "mnt-gz50-1926.asc"] category: "Terrain";
+	parameter "DEM file" var: dem_name among: ["DEM_Hanoi_Asc.asc", "mnt-gz10.asc", "mnt-gz40.asc", "mnt-gz25.asc", "mnt-gz50.asc", "mnt-gz50-1926.asc"] category: "Terrain";
 	parameter "Use observed discharge (WaterDischarge.csv)" var: use_discharge_csv category: "Forcing";
 	parameter "Rating curve exponent" var: rating_exponent category: "Forcing";
 	parameter "Base river stage (m)" var: base_stage category: "Forcing";
